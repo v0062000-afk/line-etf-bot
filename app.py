@@ -1,0 +1,763 @@
+import os
+from dotenv import load_dotenv
+import re
+import sqlite3
+import random
+import string
+import logging
+from datetime import datetime, timedelta
+from typing import List, Optional, Tuple
+
+import requests
+import yfinance as yf
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from zoneinfo import ZoneInfo
+
+from linebot.v3.messaging import (
+    ApiClient,
+    Configuration,
+    MessagingApi,
+    PushMessageRequest,
+    ReplyMessageRequest,
+    TextMessage,
+)
+from linebot.v3.webhook import WebhookHandler
+from linebot.v3.webhooks import FollowEvent, MessageEvent, TextMessageContent
+from linebot.v3.exceptions import InvalidSignatureError
+
+load_dotenv()
+
+TAIWAN_TZ = ZoneInfo("Asia/Taipei")
+DB_PATH = os.getenv("DB_PATH", "bot.db")
+ADMIN_USER_IDS = {x.strip() for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()}
+DEFAULT_TRIAL_DAYS = int(os.getenv("DEFAULT_TRIAL_DAYS", "7"))
+DAILY_PUSH_HOUR = int(os.getenv("DAILY_PUSH_HOUR", "8"))
+DAILY_PUSH_MINUTE = int(os.getenv("DAILY_PUSH_MINUTE", "0"))
+BASE_WATCHLIST = [x.strip() for x in os.getenv("BASE_WATCHLIST", "0056").split(",") if x.strip()]
+
+CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
+    raise RuntimeError("請先設定 LINE_CHANNEL_SECRET 與 LINE_CHANNEL_ACCESS_TOKEN")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="LINE ETF 推播機器人")
+handler = WebhookHandler(CHANNEL_SECRET)
+configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+
+
+def db_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    conn = db_conn()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            last_seen_at TEXT,
+            access_expires_at TEXT,
+            is_blocked INTEGER NOT NULL DEFAULT 0,
+            plan_name TEXT NOT NULL DEFAULT 'trial'
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(user_id, symbol)
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS redeem_codes (
+            code TEXT PRIMARY KEY,
+            days INTEGER NOT NULL,
+            max_uses INTEGER NOT NULL DEFAULT 1,
+            used_count INTEGER NOT NULL DEFAULT 0,
+            expires_at TEXT,
+            created_at TEXT NOT NULL,
+            created_by TEXT,
+            note TEXT
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS redemptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            redeemed_at TEXT NOT NULL,
+            days INTEGER NOT NULL
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS push_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            pushed_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            message TEXT
+        )
+        """
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def now_str() -> str:
+    return datetime.now(TAIWAN_TZ).isoformat()
+
+
+def parse_dt(text: Optional[str]) -> Optional[datetime]:
+    if not text:
+        return None
+    return datetime.fromisoformat(text)
+
+
+def normalize_symbol(symbol: str) -> str:
+    return symbol.strip().upper().replace(".TW", "").replace(".TWO", "")
+
+
+def ensure_user(user_id: str) -> None:
+    conn = db_conn()
+    cur = conn.cursor()
+    row = cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)).fetchone()
+
+    if row is None:
+        expires_at = (datetime.now(TAIWAN_TZ) + timedelta(days=DEFAULT_TRIAL_DAYS)).isoformat()
+        cur.execute(
+            """
+            INSERT INTO users (user_id, created_at, last_seen_at, access_expires_at, plan_name)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, now_str(), now_str(), expires_at, "trial"),
+        )
+        for symbol in BASE_WATCHLIST:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO subscriptions (user_id, symbol, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (user_id, normalize_symbol(symbol), now_str()),
+            )
+    else:
+        cur.execute(
+            "UPDATE users SET last_seen_at = ?, is_blocked = 0 WHERE user_id = ?",
+            (now_str(), user_id),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def mark_blocked(user_id: str) -> None:
+    conn = db_conn()
+    conn.execute("UPDATE users SET is_blocked = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def user_status(user_id: str) -> Tuple[bool, Optional[datetime], str]:
+    conn = db_conn()
+    row = conn.execute(
+        "SELECT access_expires_at, plan_name FROM users WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return False, None, "unknown"
+
+    expires_at = parse_dt(row["access_expires_at"])
+    active = bool(expires_at and expires_at >= datetime.now(TAIWAN_TZ))
+    return active, expires_at, row["plan_name"]
+
+
+def add_subscription(user_id: str, symbol: str) -> str:
+    symbol = normalize_symbol(symbol)
+    conn = db_conn()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO subscriptions (user_id, symbol, created_at)
+        VALUES (?, ?, ?)
+        """,
+        (user_id, symbol, now_str()),
+    )
+    conn.commit()
+    conn.close()
+    return symbol
+
+
+def remove_subscription(user_id: str, symbol: str) -> str:
+    symbol = normalize_symbol(symbol)
+    conn = db_conn()
+    conn.execute("DELETE FROM subscriptions WHERE user_id = ? AND symbol = ?", (user_id, symbol))
+    conn.commit()
+    conn.close()
+    return symbol
+
+
+def get_subscriptions(user_id: str) -> List[str]:
+    conn = db_conn()
+    rows = conn.execute(
+        "SELECT symbol FROM subscriptions WHERE user_id = ? ORDER BY symbol ASC",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return [row["symbol"] for row in rows]
+
+
+def generate_code(
+    days: int,
+    note: str = "",
+    max_uses: int = 1,
+    expires_days: Optional[int] = None,
+    created_by: str = "",
+) -> str:
+    code = "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
+    expires_at = None
+
+    if expires_days:
+        expires_at = (datetime.now(TAIWAN_TZ) + timedelta(days=expires_days)).isoformat()
+
+    conn = db_conn()
+    conn.execute(
+        """
+        INSERT INTO redeem_codes
+        (code, days, max_uses, used_count, expires_at, created_at, created_by, note)
+        VALUES (?, ?, ?, 0, ?, ?, ?, ?)
+        """,
+        (code, days, max_uses, expires_at, now_str(), created_by, note),
+    )
+    conn.commit()
+    conn.close()
+    return code
+
+
+def redeem_code(user_id: str, code: str) -> Tuple[bool, str]:
+    conn = db_conn()
+    cur = conn.cursor()
+    code = code.strip().upper()
+
+    row = cur.execute("SELECT * FROM redeem_codes WHERE code = ?", (code,)).fetchone()
+    if not row:
+        conn.close()
+        return False, "查無此序號。"
+
+    expires_at = parse_dt(row["expires_at"])
+    if expires_at and expires_at < datetime.now(TAIWAN_TZ):
+        conn.close()
+        return False, "此序號已過期。"
+
+    if row["used_count"] >= row["max_uses"]:
+        conn.close()
+        return False, "此序號已被使用完畢。"
+
+    user_row = cur.execute(
+        "SELECT access_expires_at FROM users WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+
+    base = datetime.now(TAIWAN_TZ)
+    if user_row and user_row["access_expires_at"]:
+        current_expire = parse_dt(user_row["access_expires_at"])
+        if current_expire and current_expire > base:
+            base = current_expire
+
+    new_expire = base + timedelta(days=row["days"])
+
+    cur.execute(
+        "UPDATE users SET access_expires_at = ?, plan_name = ? WHERE user_id = ?",
+        (new_expire.isoformat(), f"paid_{row['days']}d", user_id),
+    )
+    cur.execute(
+        "UPDATE redeem_codes SET used_count = used_count + 1 WHERE code = ?",
+        (code,),
+    )
+    cur.execute(
+        """
+        INSERT INTO redemptions (code, user_id, redeemed_at, days)
+        VALUES (?, ?, ?, ?)
+        """,
+        (code, user_id, now_str(), row["days"]),
+    )
+    conn.commit()
+    conn.close()
+
+    return True, f"兌換成功，已延長 {row['days']} 天，到期日：{new_expire.strftime('%Y-%m-%d %H:%M')}"
+
+
+def vix_to_fear_proxy(vix_value: float) -> int:
+    """
+    用 VIX 推估 0~100 的情緒分數。
+    VIX 越高，分數越低，代表越恐慌。
+    這不是 CNN 官方值，是 fallback 代理值。
+    """
+    if vix_value >= 40:
+        return 5
+    if vix_value >= 35:
+        return 10
+    if vix_value >= 30:
+        return 20
+    if vix_value >= 25:
+        return 30
+    if vix_value >= 20:
+        return 45
+    if vix_value >= 17:
+        return 55
+    if vix_value >= 14:
+        return 70
+    if vix_value >= 11:
+        return 82
+    return 90
+
+
+def fear_label(value: Optional[int]) -> str:
+    if value is None:
+        return "無法取得"
+    if value <= 24:
+        return "極度恐慌"
+    if value <= 44:
+        return "恐慌"
+    if value <= 54:
+        return "中性"
+    if value <= 74:
+        return "貪婪"
+    return "極度貪婪"
+
+
+def get_fear_greed() -> Tuple[Optional[int], str]:
+    """
+    回傳:
+    - score: 0~100
+    - source: 資料來源
+
+    優先順序:
+    1) CNN graphdata
+    2) CNN 頁面文字
+    3) VIX fallback
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    cnn_urls = [
+        "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+        "https://production.dataviz.cnn.io/index/fearandgreed/graphdata/",
+    ]
+
+    for url in cnn_urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.ok and r.text.strip().startswith("{"):
+                data = r.json()
+                possible_paths = [
+                    ("fear_and_greed", "score"),
+                    ("fear_and_greed", "value"),
+                    ("score",),
+                    ("value",),
+                ]
+                for key_path in possible_paths:
+                    obj = data
+                    ok = True
+                    for key in key_path:
+                        if isinstance(obj, dict) and key in obj:
+                            obj = obj[key]
+                        else:
+                            ok = False
+                            break
+                    if ok and isinstance(obj, (int, float)):
+                        return int(round(obj)), "CNN Fear & Greed"
+        except Exception:
+            pass
+
+    cnn_page_urls = [
+        "https://edition.cnn.com/markets/fear-and-greed",
+        "https://www.cnn.com/markets/fear-and-greed",
+    ]
+
+    for url in cnn_page_urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.ok:
+                text = r.text
+                patterns = [
+                    r'Fear\s*&\s*Greed[^0-9]{0,40}(\d{1,3})',
+                    r'"score"\s*:\s*(\d{1,3})',
+                    r'"value"\s*:\s*(\d{1,3})',
+                ]
+                for pattern in patterns:
+                    m = re.search(pattern, text, re.I | re.S)
+                    if m:
+                        return int(m.group(1)), "CNN Fear & Greed"
+        except Exception:
+            pass
+
+    try:
+        vix_df = yf.Ticker("^VIX").history(period="10d", auto_adjust=False)
+        if vix_df is not None and not vix_df.empty:
+            close = vix_df["Close"].dropna()
+            if not close.empty:
+                latest_vix = float(close.iloc[-1])
+                proxy_score = vix_to_fear_proxy(latest_vix)
+                return proxy_score, f"VIX fallback ({latest_vix:.2f})"
+    except Exception:
+        pass
+
+    return None, "unavailable"
+
+
+def get_price_data(symbol: str, lookback_days: int = 450) -> dict:
+    sym = normalize_symbol(symbol)
+    tried = [f"{sym}.TW", f"{sym}.TWO"]
+    hist = None
+    last_error = None
+    used = None
+
+    for candidate in tried:
+        try:
+            df = yf.Ticker(candidate).history(period=f"{lookback_days}d", auto_adjust=False)
+            if df is not None and not df.empty:
+                hist = df.copy()
+                used = candidate
+                break
+        except Exception as e:
+            last_error = str(e)
+
+    if hist is None or hist.empty:
+        raise ValueError(f"抓不到 {sym} 資料：{last_error or 'empty'}")
+
+    close = hist["Close"].dropna()
+    latest_price = float(close.iloc[-1])
+    ma30 = float(close.tail(30).mean()) if len(close) >= 30 else float(close.mean())
+    ma300 = float(close.tail(300).mean()) if len(close) >= 300 else float(close.mean())
+    date = close.index[-1].to_pydatetime().astimezone(TAIWAN_TZ)
+
+    return {
+        "symbol": sym,
+        "source_symbol": used,
+        "close": round(latest_price, 2),
+        "ma30": round(ma30, 2),
+        "ma300": round(ma300, 2),
+        "date": date.strftime("%Y-%m-%d"),
+        "vs_ma30_pct": round((latest_price - ma30) / ma30 * 100, 2),
+        "vs_ma300_pct": round((latest_price - ma300) / ma300 * 100, 2),
+    }
+
+
+def recommendation_for_0056(fear_value: Optional[int], data: dict) -> Tuple[str, str]:
+    diff30 = data["vs_ma30_pct"]
+    diff300 = data["vs_ma300_pct"]
+
+    if fear_value is not None and fear_value < 25 and diff30 <= -3:
+        return "🔥 強烈加碼", "恐慌明顯，且價格低於近30日均線 3% 以上。"
+
+    if (fear_value is not None and fear_value < 30 and diff30 <= 0) or diff300 <= -5:
+        return "🟡 可分批加碼", "情緒偏弱且價格不高，可分批布局。"
+
+    if diff30 > 3 and diff300 > 8:
+        return "⚠️ 先觀望", "股價高於短中期均線較多，先保留現金。"
+
+    return "🟢 可小量布局", "價格接近均線附近，可小量定期投入。"
+
+
+def general_stock_summary(data: dict) -> str:
+    return (
+        f"📌 {data['symbol']} 重點：\n"
+        f"收盤價：{data['close']}\n"
+        f"近30天平均價：{data['ma30']}\n"
+        f"近300天平均價：{data['ma300']}\n"
+        f"與30日均差距：{data['vs_ma30_pct']}%\n"
+        f"與300日均差距：{data['vs_ma300_pct']}%"
+    )
+
+
+def build_daily_report_for_user(user_id: str) -> str:
+    fear_value, fg_source = get_fear_greed()
+
+    lines = [
+        f"📊 每日投資提醒（{datetime.now(TAIWAN_TZ).strftime('%Y/%m/%d')} {DAILY_PUSH_HOUR:02d}:{DAILY_PUSH_MINUTE:02d}）",
+        "",
+    ]
+
+    if fg_source.startswith("VIX fallback"):
+        lines.extend(
+            [
+                f"😱 市場情緒代理值：{fear_value if fear_value is not None else 'N/A'}（{fear_label(fear_value)}）",
+                f"資料來源：{fg_source}",
+                "",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"😱 恐慌指數：{fear_value if fear_value is not None else 'N/A'}（{fear_label(fear_value)}）",
+                f"資料來源：{fg_source}",
+                "",
+            ]
+        )
+
+    symbols = get_subscriptions(user_id)
+    if "0056" not in symbols:
+        symbols = ["0056"] + symbols
+
+    summary_lines = []
+    for symbol in symbols:
+        try:
+            data = get_price_data(symbol)
+            if symbol == "0056":
+                rec, reason = recommendation_for_0056(fear_value, data)
+                lines.extend(
+                    [
+                        "📈 0056 重點：",
+                        f"收盤價：{data['close']}",
+                        f"近30天平均價：{data['ma30']}",
+                        f"近300天平均價：{data['ma300']}",
+                        f"與30日均差距：{data['vs_ma30_pct']}%",
+                        f"與300日均差距：{data['vs_ma300_pct']}%",
+                        f"是否建議加碼：{rec}",
+                        f"原因：{reason}",
+                        "",
+                    ]
+                )
+            else:
+                summary_lines.append(general_stock_summary(data))
+        except Exception as e:
+            summary_lines.append(f"📌 {symbol} 抓取失敗：{e}")
+
+    if summary_lines:
+        lines.append("👀 你的自選股票：")
+        lines.extend(summary_lines)
+        lines.append("")
+
+    lines.extend(
+        [
+            "可用指令：",
+            "新增股票 2330",
+            "刪除股票 2330",
+            "我的股票",
+            "狀態",
+            "兌換 ABCD123456",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+def reply_message(reply_token: str, text: str) -> None:
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        api.reply_message(
+            ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[TextMessage(text=text)],
+            )
+        )
+
+
+def push_text(user_id: str, text: str) -> None:
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        api.push_message(
+            PushMessageRequest(to=user_id, messages=[TextMessage(text=text)])
+        )
+
+
+def log_push(user_id: str, status: str, message: str = "") -> None:
+    conn = db_conn()
+    conn.execute(
+        "INSERT INTO push_logs (user_id, pushed_at, status, message) VALUES (?, ?, ?, ?)",
+        (user_id, now_str(), status, message[:1000]),
+    )
+    conn.commit()
+    conn.close()
+
+
+def run_daily_push() -> None:
+    logger.info("開始執行每日推播")
+    conn = db_conn()
+    rows = conn.execute(
+        "SELECT user_id, access_expires_at, is_blocked FROM users WHERE is_blocked = 0"
+    ).fetchall()
+    conn.close()
+
+    for row in rows:
+        expires_at = parse_dt(row["access_expires_at"])
+        if not expires_at or expires_at < datetime.now(TAIWAN_TZ):
+            log_push(row["user_id"], "skip", "expired")
+            continue
+
+        try:
+            text = build_daily_report_for_user(row["user_id"])
+            push_text(row["user_id"], text)
+            log_push(row["user_id"], "success", "ok")
+        except Exception as e:
+            logger.exception("推播失敗 user_id=%s", row["user_id"])
+            log_push(row["user_id"], "error", str(e))
+
+
+def help_text() -> str:
+    return (
+        "可用指令：\n"
+        "1) 今日報告\n"
+        "2) 新增股票 2330\n"
+        "3) 刪除股票 2330\n"
+        "4) 我的股票\n"
+        "5) 狀態\n"
+        "6) 兌換 ABCD123456\n"
+        "\n"
+        "管理者指令：\n"
+        "7) 產生序號 30\n"
+        "8) 產生序號 30 5\n"
+        "9) 試推播\n"
+        "10) 查ID"
+    )
+
+
+def handle_text_command(user_id: str, text: str) -> str:
+    cmd = text.strip()
+    active, expires_at, plan_name = user_status(user_id)
+
+    if cmd in {"help", "幫助", "說明", "menu", "選單"}:
+        return help_text()
+
+    if cmd == "查ID":
+        return f"你的 LINE USER ID：{user_id}"
+
+    if cmd in {"狀態", "我的狀態"}:
+        return (
+            f"方案：{plan_name}\n"
+            f"到期：{expires_at.strftime('%Y-%m-%d %H:%M') if expires_at else '未設定'}\n"
+            f"目前狀態：{'可接收推播' if active else '已過期，請兌換序號'}"
+        )
+
+    if cmd == "我的股票":
+        symbols = get_subscriptions(user_id)
+        return "你的股票：" + ("、".join(symbols) if symbols else "尚未設定")
+
+    if cmd in {"今日報告", "今日", "report"}:
+        if not active:
+            return "你的使用期限已到，請先輸入：兌換 序號"
+        return build_daily_report_for_user(user_id)
+
+    m = re.match(r"^新增股票\s+([0-9A-Za-z]{2,10})$", cmd)
+    if m:
+        symbol = add_subscription(user_id, m.group(1))
+        return f"已加入 {symbol} 到每日推播。"
+
+    m = re.match(r"^刪除股票\s+([0-9A-Za-z]{2,10})$", cmd)
+    if m:
+        symbol = remove_subscription(user_id, m.group(1))
+        return f"已刪除 {symbol}。"
+
+    m = re.match(r"^兌換\s+([A-Za-z0-9]{6,20})$", cmd)
+    if m:
+        ok, msg = redeem_code(user_id, m.group(1))
+        return msg
+
+    if user_id in ADMIN_USER_IDS:
+        m = re.match(r"^產生序號\s+(\d{1,4})(?:\s+(\d{1,3}))?$", cmd)
+        if m:
+            days = int(m.group(1))
+            qty = int(m.group(2) or 1)
+            codes = [generate_code(days=days, created_by=user_id) for _ in range(qty)]
+            return "以下為新序號：\n" + "\n".join(codes)
+
+        if cmd == "試推播":
+            report = build_daily_report_for_user(user_id)
+            return "測試內容如下：\n\n" + report
+
+    return "看不懂你的指令。\n\n" + help_text()
+
+
+@handler.add(FollowEvent)
+def handle_follow(event: FollowEvent):
+    user_id = event.source.user_id
+    ensure_user(user_id)
+    reply_message(
+        event.reply_token,
+        (
+            f"歡迎加入！你已獲得 {DEFAULT_TRIAL_DAYS} 天試用。\n"
+            f"每天 {DAILY_PUSH_HOUR:02d}:{DAILY_PUSH_MINUTE:02d} 會推播市場情緒與 0056 分析。\n\n"
+            + help_text()
+        ),
+    )
+
+
+@handler.add(MessageEvent, message=TextMessageContent)
+def handle_message(event: MessageEvent):
+    user_id = event.source.user_id
+    ensure_user(user_id)
+    text = event.message.text
+    response = handle_text_command(user_id, text)
+    reply_message(event.reply_token, response)
+
+
+@app.get("/")
+def root():
+    return {"ok": True, "message": "LINE ETF bot running"}
+
+
+@app.get("/health")
+def health():
+    return {"ok": True, "time": now_str()}
+
+
+@app.post("/callback")
+async def callback(request: Request, x_line_signature: str = Header(None)):
+    body = await request.body()
+    try:
+        handler.handle(body.decode("utf-8"), x_line_signature)
+    except InvalidSignatureError as e:
+        raise HTTPException(status_code=400, detail="Invalid signature") from e
+    except Exception as e:
+        logger.exception("webhook error")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return JSONResponse({"ok": True})
+
+
+scheduler = BackgroundScheduler(timezone=TAIWAN_TZ)
+
+
+@app.on_event("startup")
+def startup_event():
+    init_db()
+    if not scheduler.running:
+        scheduler.add_job(
+            run_daily_push,
+            CronTrigger(hour=DAILY_PUSH_HOUR, minute=DAILY_PUSH_MINUTE, timezone=TAIWAN_TZ),
+            id="daily_push",
+            replace_existing=True,
+        )
+        scheduler.start()
+        logger.info("scheduler started")
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
