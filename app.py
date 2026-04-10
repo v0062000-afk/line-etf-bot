@@ -383,7 +383,7 @@ def get_price_data(symbol: str, lookback_days: int = 450) -> Dict[str, Any]:
     }
 
 
-def recommendation_for_core_etf(fear_value: Optional[int], data: Dict[str, Any]) -> Tuple[str, str]:
+def recommendation_for_0056(fear_value: Optional[int], data: Dict[str, Any]) -> Tuple[str, str]:
     diff30 = data["vs_ma30_pct"]
     diff300 = data["vs_ma300_pct"]
 
@@ -444,7 +444,7 @@ def build_daily_report_for_user(user_id: str) -> str:
         try:
             data = get_price_data(symbol)
             if symbol == "0056":
-                rec, reason = recommendation_for_core_etf(fear_value, data)
+                rec, reason = recommendation_for_0056(fear_value, data)
                 lines.extend(
                     [
                         "📈 0056 重點：",
