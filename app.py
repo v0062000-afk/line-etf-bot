@@ -1,4 +1,5 @@
 import os
+from dotenv import load_dotenv
 import re
 import sqlite3
 import random
@@ -8,7 +9,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict, Any
 
 import requests
-from dotenv import load_dotenv
+import yfinance as yf
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from zoneinfo import ZoneInfo
@@ -42,12 +43,9 @@ if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LINE ETF / 台股官方資料機器人")
+app = FastAPI(title="LINE ETF 查詢機器人")
 handler = WebhookHandler(CHANNEL_SECRET)
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
-
-HTTP_TIMEOUT = 15
-HTTP_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
 def db_conn() -> sqlite3.Connection:
@@ -144,6 +142,7 @@ def ensure_user(user_id: str) -> None:
             """,
             (user_id, now_str(), now_str(), expires_at, "trial"),
         )
+
         for symbol in BASE_WATCHLIST:
             cur.execute(
                 """
@@ -328,8 +327,6 @@ def fear_label(value: Optional[int]) -> str:
 
 def get_fear_greed() -> Tuple[Optional[int], str]:
     try:
-        import yfinance as yf
-
         vix_df = yf.Ticker("^VIX").history(period="10d", auto_adjust=False)
         if vix_df is not None and not vix_df.empty:
             close = vix_df["Close"].dropna()
@@ -343,183 +340,47 @@ def get_fear_greed() -> Tuple[Optional[int], str]:
     return None, "unavailable"
 
 
-def _safe_float(text: str) -> Optional[float]:
-    if text is None:
-        return None
-    s = str(text).strip().replace(",", "").replace(" ", "")
-    if s in {"", "--", "---", "----", "X", "除權息", "除息", "除權", "N/A"}:
-        return None
-    try:
-        return float(s)
-    except Exception:
-        return None
+def get_price_data(symbol: str, lookback_days: int = 450) -> Dict[str, Any]:
+    sym = normalize_symbol(symbol)
+    tried = [f"{sym}.TW", f"{sym}.TWO"]
+    hist = None
+    last_error = None
+    used = None
 
-
-def _month_iter(count: int) -> List[datetime]:
-    today = datetime.now(TAIWAN_TZ)
-    y = today.year
-    m = today.month
-    out: List[datetime] = []
-    for _ in range(count):
-        out.append(datetime(y, m, 1))
-        m -= 1
-        if m == 0:
-            m = 12
-            y -= 1
-    return out
-
-
-def _fetch_twse_month(stock_id: str, month_dt: datetime) -> List[Tuple[str, float]]:
-    date_str = month_dt.strftime("%Y%m01")
-    url = (
-        "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
-        f"?response=json&date={date_str}&stockNo={stock_id}"
-    )
-    r = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-
-    if data.get("stat") != "OK" or not data.get("data"):
-        return []
-
-    rows: List[Tuple[str, float]] = []
-    for row in data["data"]:
-        # row[0]=日期, row[6]=收盤價
-        close_price = _safe_float(row[6])
-        if close_price is None:
-            continue
-        # 日期格式例如 115/04/10
-        roc_date = row[0].strip()
-        parts = roc_date.split("/")
-        if len(parts) == 3:
-            year = int(parts[0]) + 1911
-            month = int(parts[1])
-            day = int(parts[2])
-            gregorian = f"{year:04d}-{month:02d}-{day:02d}"
-        else:
-            gregorian = roc_date
-        rows.append((gregorian, close_price))
-    return rows
-
-
-def _fetch_tpex_month(stock_id: str, month_dt: datetime) -> List[Tuple[str, float]]:
-    roc_year = month_dt.year - 1911
-    roc_month = month_dt.month
-    url = (
-        "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
-        f"?l=zh-tw&d={roc_year}/{roc_month:02d}&stkno={stock_id}"
-    )
-    r = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-
-    if not data.get("aaData"):
-        return []
-
-    rows: List[Tuple[str, float]] = []
-    for row in data["aaData"]:
-        # 常見格式:
-        # row[0]=日期, row[2]=收盤價
-        close_price = _safe_float(row[2])
-        if close_price is None:
-            continue
-
-        roc_date = str(row[0]).strip()
-        parts = roc_date.split("/")
-        if len(parts) == 3:
-            year = int(parts[0]) + 1911
-            month = int(parts[1])
-            day = int(parts[2])
-            gregorian = f"{year:04d}-{month:02d}-{day:02d}"
-        else:
-            gregorian = roc_date
-
-        rows.append((gregorian, close_price))
-    return rows
-
-
-def get_official_tw_data(stock_id: str, max_months: int = 18) -> Dict[str, Any]:
-    """
-    用台股官方資料抓歷史收盤。
-    先試上市 TWSE，再試上櫃 TPEx。
-    回傳:
-    {
-        symbol,
-        market,
-        data_date,
-        close,
-        ma30,
-        ma300,
-        vs_ma30_pct,
-        vs_ma300_pct
-    }
-    """
-    stock_id = normalize_symbol(stock_id)
-    months = _month_iter(max_months)
-
-    twse_rows: List[Tuple[str, float]] = []
-    tpex_rows: List[Tuple[str, float]] = []
-
-    # 先抓上市
-    twse_ok = False
-    for month_dt in months:
+    for candidate in tried:
         try:
-            rows = _fetch_twse_month(stock_id, month_dt)
-            if rows:
-                twse_ok = True
-                twse_rows.extend(rows)
-        except Exception:
-            continue
+            df = yf.Ticker(candidate).history(period=f"{lookback_days}d", auto_adjust=False)
+            if df is not None and not df.empty:
+                hist = df.copy()
+                used = candidate
+                break
+        except Exception as e:
+            last_error = str(e)
 
-    if twse_ok and twse_rows:
-        rows = twse_rows
-        market = "TWSE"
-    else:
-        # 再抓上櫃
-        tpex_ok = False
-        for month_dt in months:
-            try:
-                rows = _fetch_tpex_month(stock_id, month_dt)
-                if rows:
-                    tpex_ok = True
-                    tpex_rows.extend(rows)
-            except Exception:
-                continue
+    if hist is None or hist.empty:
+        raise ValueError(f"抓不到 {sym} 資料：{last_error or 'empty'}")
 
-        if not tpex_ok or not tpex_rows:
-            raise ValueError(f"{stock_id} 抓不到官方資料")
+    close = hist["Close"].dropna()
+    latest_dt = close.index[-1]
+    latest_price = float(close.iloc[-1])
 
-        rows = tpex_rows
-        market = "TPEx"
+    ma30 = float(close.tail(30).mean()) if len(close) >= 30 else float(close.mean())
+    ma300 = float(close.tail(300).mean()) if len(close) >= 300 else float(close.mean())
 
-    # 去重 + 排序
-    dedup: Dict[str, float] = {}
-    for d, c in rows:
-        dedup[d] = c
-
-    sorted_rows = sorted(dedup.items(), key=lambda x: x[0])
-    closes = [price for _, price in sorted_rows]
-
-    if not closes:
-        raise ValueError(f"{stock_id} 沒有有效收盤價資料")
-
-    latest_date, latest_close = sorted_rows[-1]
-
-    ma30_src = closes[-30:] if len(closes) >= 30 else closes
-    ma300_src = closes[-300:] if len(closes) >= 300 else closes
-
-    ma30 = sum(ma30_src) / len(ma30_src)
-    ma300 = sum(ma300_src) / len(ma300_src)
+    try:
+        latest_date = latest_dt.tz_localize(None).strftime("%Y-%m-%d")
+    except Exception:
+        latest_date = latest_dt.strftime("%Y-%m-%d")
 
     return {
-        "symbol": stock_id,
-        "market": market,
-        "data_date": latest_date,
-        "close": round(latest_close, 2),
+        "symbol": sym,
+        "source_symbol": used,
+        "close": round(latest_price, 2),
         "ma30": round(ma30, 2),
         "ma300": round(ma300, 2),
-        "vs_ma30_pct": round((latest_close - ma30) / ma30 * 100, 2),
-        "vs_ma300_pct": round((latest_close - ma300) / ma300 * 100, 2),
+        "vs_ma30_pct": round((latest_price - ma30) / ma30 * 100, 2),
+        "vs_ma300_pct": round((latest_price - ma300) / ma300 * 100, 2),
+        "data_date": latest_date,
     }
 
 
@@ -582,7 +443,7 @@ def build_daily_report_for_user(user_id: str) -> str:
     extra_lines: List[str] = []
     for symbol in symbols:
         try:
-            data = get_official_tw_data(symbol)
+            data = get_price_data(symbol)
             if symbol == "0056":
                 rec, reason = recommendation_for_core_etf(fear_value, data)
                 lines.extend(
@@ -666,7 +527,7 @@ def handle_text_command(user_id: str, text: str) -> str:
         return help_text()
 
     if cmd == "查ID":
-        return f"你的 LINE USER ID：{user_id}"
+        return f"你的 LINE USER ID：\n{user_id}"
 
     if cmd in {"狀態", "我的狀態"}:
         return (
