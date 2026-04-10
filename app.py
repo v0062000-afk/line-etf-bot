@@ -1,15 +1,14 @@
 import os
-from dotenv import load_dotenv
 import re
 import sqlite3
 import random
 import string
 import logging
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 
 import requests
-import yfinance as yf
+from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from zoneinfo import ZoneInfo
@@ -18,6 +17,7 @@ from linebot.v3.messaging import (
     ApiClient,
     Configuration,
     MessagingApi,
+    PushMessageRequest,
     ReplyMessageRequest,
     TextMessage,
 )
@@ -42,9 +42,12 @@ if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LINE ETF 查詢機器人")
+app = FastAPI(title="LINE ETF / 台股官方資料機器人")
 handler = WebhookHandler(CHANNEL_SECRET)
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+
+HTTP_TIMEOUT = 15
+HTTP_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
 def db_conn() -> sqlite3.Connection:
@@ -141,7 +144,6 @@ def ensure_user(user_id: str) -> None:
             """,
             (user_id, now_str(), now_str(), expires_at, "trial"),
         )
-
         for symbol in BASE_WATCHLIST:
             cur.execute(
                 """
@@ -325,39 +327,9 @@ def fear_label(value: Optional[int]) -> str:
 
 
 def get_fear_greed() -> Tuple[Optional[int], str]:
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    cnn_urls = [
-        "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
-        "https://production.dataviz.cnn.io/index/fearandgreed/graphdata/",
-    ]
-
-    for url in cnn_urls:
-        try:
-            r = requests.get(url, headers=headers, timeout=10)
-            if r.ok and r.text.strip().startswith("{"):
-                data = r.json()
-                possible_paths = [
-                    ("fear_and_greed", "score"),
-                    ("fear_and_greed", "value"),
-                    ("score",),
-                    ("value",),
-                ]
-                for key_path in possible_paths:
-                    obj = data
-                    ok = True
-                    for key in key_path:
-                        if isinstance(obj, dict) and key in obj:
-                            obj = obj[key]
-                        else:
-                            ok = False
-                            break
-                    if ok and isinstance(obj, (int, float)):
-                        return int(round(obj)), "CNN Fear & Greed"
-        except Exception:
-            pass
-
     try:
+        import yfinance as yf
+
         vix_df = yf.Ticker("^VIX").history(period="10d", auto_adjust=False)
         if vix_df is not None and not vix_df.empty:
             close = vix_df["Close"].dropna()
@@ -371,59 +343,206 @@ def get_fear_greed() -> Tuple[Optional[int], str]:
     return None, "unavailable"
 
 
-def get_price_data(symbol: str, lookback_days: int = 450) -> dict:
-    sym = normalize_symbol(symbol)
-    tried = [f"{sym}.TW", f"{sym}.TWO"]
-    hist = None
-    last_error = None
+def _safe_float(text: str) -> Optional[float]:
+    if text is None:
+        return None
+    s = str(text).strip().replace(",", "").replace(" ", "")
+    if s in {"", "--", "---", "----", "X", "除權息", "除息", "除權", "N/A"}:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
 
-    for candidate in tried:
+
+def _month_iter(count: int) -> List[datetime]:
+    today = datetime.now(TAIWAN_TZ)
+    y = today.year
+    m = today.month
+    out: List[datetime] = []
+    for _ in range(count):
+        out.append(datetime(y, m, 1))
+        m -= 1
+        if m == 0:
+            m = 12
+            y -= 1
+    return out
+
+
+def _fetch_twse_month(stock_id: str, month_dt: datetime) -> List[Tuple[str, float]]:
+    date_str = month_dt.strftime("%Y%m01")
+    url = (
+        "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
+        f"?response=json&date={date_str}&stockNo={stock_id}"
+    )
+    r = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+
+    if data.get("stat") != "OK" or not data.get("data"):
+        return []
+
+    rows: List[Tuple[str, float]] = []
+    for row in data["data"]:
+        # row[0]=日期, row[6]=收盤價
+        close_price = _safe_float(row[6])
+        if close_price is None:
+            continue
+        # 日期格式例如 115/04/10
+        roc_date = row[0].strip()
+        parts = roc_date.split("/")
+        if len(parts) == 3:
+            year = int(parts[0]) + 1911
+            month = int(parts[1])
+            day = int(parts[2])
+            gregorian = f"{year:04d}-{month:02d}-{day:02d}"
+        else:
+            gregorian = roc_date
+        rows.append((gregorian, close_price))
+    return rows
+
+
+def _fetch_tpex_month(stock_id: str, month_dt: datetime) -> List[Tuple[str, float]]:
+    roc_year = month_dt.year - 1911
+    roc_month = month_dt.month
+    url = (
+        "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
+        f"?l=zh-tw&d={roc_year}/{roc_month:02d}&stkno={stock_id}"
+    )
+    r = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+
+    if not data.get("aaData"):
+        return []
+
+    rows: List[Tuple[str, float]] = []
+    for row in data["aaData"]:
+        # 常見格式:
+        # row[0]=日期, row[2]=收盤價
+        close_price = _safe_float(row[2])
+        if close_price is None:
+            continue
+
+        roc_date = str(row[0]).strip()
+        parts = roc_date.split("/")
+        if len(parts) == 3:
+            year = int(parts[0]) + 1911
+            month = int(parts[1])
+            day = int(parts[2])
+            gregorian = f"{year:04d}-{month:02d}-{day:02d}"
+        else:
+            gregorian = roc_date
+
+        rows.append((gregorian, close_price))
+    return rows
+
+
+def get_official_tw_data(stock_id: str, max_months: int = 18) -> Dict[str, Any]:
+    """
+    用台股官方資料抓歷史收盤。
+    先試上市 TWSE，再試上櫃 TPEx。
+    回傳:
+    {
+        symbol,
+        market,
+        data_date,
+        close,
+        ma30,
+        ma300,
+        vs_ma30_pct,
+        vs_ma300_pct
+    }
+    """
+    stock_id = normalize_symbol(stock_id)
+    months = _month_iter(max_months)
+
+    twse_rows: List[Tuple[str, float]] = []
+    tpex_rows: List[Tuple[str, float]] = []
+
+    # 先抓上市
+    twse_ok = False
+    for month_dt in months:
         try:
-            df = yf.Ticker(candidate).history(period=f"{lookback_days}d", auto_adjust=False)
-            if df is not None and not df.empty:
-                hist = df.copy()
-                break
-        except Exception as e:
-            last_error = str(e)
+            rows = _fetch_twse_month(stock_id, month_dt)
+            if rows:
+                twse_ok = True
+                twse_rows.extend(rows)
+        except Exception:
+            continue
 
-    if hist is None or hist.empty:
-        raise ValueError(f"抓不到 {sym} 資料：{last_error or 'empty'}")
+    if twse_ok and twse_rows:
+        rows = twse_rows
+        market = "TWSE"
+    else:
+        # 再抓上櫃
+        tpex_ok = False
+        for month_dt in months:
+            try:
+                rows = _fetch_tpex_month(stock_id, month_dt)
+                if rows:
+                    tpex_ok = True
+                    tpex_rows.extend(rows)
+            except Exception:
+                continue
 
-    close = hist["Close"].dropna()
-    latest_price = float(close.iloc[-1])
-    ma30 = float(close.tail(30).mean()) if len(close) >= 30 else float(close.mean())
-    ma300 = float(close.tail(300).mean()) if len(close) >= 300 else float(close.mean())
+        if not tpex_ok or not tpex_rows:
+            raise ValueError(f"{stock_id} 抓不到官方資料")
+
+        rows = tpex_rows
+        market = "TPEx"
+
+    # 去重 + 排序
+    dedup: Dict[str, float] = {}
+    for d, c in rows:
+        dedup[d] = c
+
+    sorted_rows = sorted(dedup.items(), key=lambda x: x[0])
+    closes = [price for _, price in sorted_rows]
+
+    if not closes:
+        raise ValueError(f"{stock_id} 沒有有效收盤價資料")
+
+    latest_date, latest_close = sorted_rows[-1]
+
+    ma30_src = closes[-30:] if len(closes) >= 30 else closes
+    ma300_src = closes[-300:] if len(closes) >= 300 else closes
+
+    ma30 = sum(ma30_src) / len(ma30_src)
+    ma300 = sum(ma300_src) / len(ma300_src)
 
     return {
-        "symbol": sym,
-        "close": round(latest_price, 2),
+        "symbol": stock_id,
+        "market": market,
+        "data_date": latest_date,
+        "close": round(latest_close, 2),
         "ma30": round(ma30, 2),
         "ma300": round(ma300, 2),
-        "vs_ma30_pct": round((latest_price - ma30) / ma30 * 100, 2),
-        "vs_ma300_pct": round((latest_price - ma300) / ma300 * 100, 2),
+        "vs_ma30_pct": round((latest_close - ma30) / ma30 * 100, 2),
+        "vs_ma300_pct": round((latest_close - ma300) / ma300 * 100, 2),
     }
 
 
-def recommendation_for_0056(fear_value: Optional[int], data: dict) -> Tuple[str, str]:
+def recommendation_for_core_etf(fear_value: Optional[int], data: Dict[str, Any]) -> Tuple[str, str]:
     diff30 = data["vs_ma30_pct"]
     diff300 = data["vs_ma300_pct"]
 
     if fear_value is not None and fear_value < 25 and diff30 <= -3:
-        return "🔥 強烈加碼", "恐慌明顯，且價格低於近30日均線 3% 以上。"
+        return "🔥 強烈加碼", "市場偏恐慌，且價格低於近30日均線 3% 以上。"
 
-    if (fear_value is not None and fear_value < 30 and diff30 <= 0) or diff300 <= -5:
-        return "🟡 可分批加碼", "情緒偏弱且價格不高，可分批布局。"
+    if (fear_value is not None and fear_value < 35 and diff30 <= 0) or diff300 <= -5:
+        return "🟡 可分批加碼", "情緒偏弱或價格回到均線附近，可分批布局。"
 
     if diff30 > 3 and diff300 > 8:
-        return "⚠️ 先觀望", "股價高於短中期均線較多，先保留現金。"
+        return "⚠️ 先觀望", "價格高於短中期均線較多，先保留資金。"
 
     return "🟢 可小量布局", "價格接近均線附近，可小量定期投入。"
 
 
-def general_stock_summary(data: dict) -> str:
+def general_stock_summary(data: Dict[str, Any]) -> str:
     return (
         f"📌 {data['symbol']} 重點：\n"
-        f"收盤價：{data['close']}\n"
+        f"最新可用收盤價（{data['data_date']}）：{data['close']}\n"
         f"近30天平均價：{data['ma30']}\n"
         f"近300天平均價：{data['ma300']}\n"
         f"與30日均差距：{data['vs_ma30_pct']}%\n"
@@ -460,16 +579,16 @@ def build_daily_report_for_user(user_id: str) -> str:
     if "0056" not in symbols:
         symbols = ["0056"] + symbols
 
-    summary_lines = []
+    extra_lines: List[str] = []
     for symbol in symbols:
         try:
-            data = get_price_data(symbol)
+            data = get_official_tw_data(symbol)
             if symbol == "0056":
-                rec, reason = recommendation_for_0056(fear_value, data)
+                rec, reason = recommendation_for_core_etf(fear_value, data)
                 lines.extend(
                     [
                         "📈 0056 重點：",
-                        f"收盤價：{data['close']}",
+                        f"最新可用收盤價（{data['data_date']}）：{data['close']}",
                         f"近30天平均價：{data['ma30']}",
                         f"近300天平均價：{data['ma300']}",
                         f"與30日均差距：{data['vs_ma30_pct']}%",
@@ -480,13 +599,13 @@ def build_daily_report_for_user(user_id: str) -> str:
                     ]
                 )
             else:
-                summary_lines.append(general_stock_summary(data))
+                extra_lines.append(general_stock_summary(data))
         except Exception as e:
-            summary_lines.append(f"📌 {symbol} 抓取失敗：{e}")
+            extra_lines.append(f"📌 {symbol} 抓取失敗：{e}")
 
-    if summary_lines:
+    if extra_lines:
         lines.append("👀 你的自選股票：")
-        lines.extend(summary_lines)
+        lines.extend(extra_lines)
         lines.append("")
 
     lines.extend(
@@ -515,6 +634,12 @@ def reply_message(reply_token: str, text: str) -> None:
         )
 
 
+def push_text(user_id: str, text: str) -> None:
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        api.push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=text)]))
+
+
 def help_text() -> str:
     return (
         "可用指令：\n"
@@ -528,7 +653,8 @@ def help_text() -> str:
         "管理者指令：\n"
         "7) 產生序號 30\n"
         "8) 產生序號 30 5\n"
-        "9) 查ID"
+        "9) 試推播\n"
+        "10) 查ID"
     )
 
 
@@ -581,6 +707,14 @@ def handle_text_command(user_id: str, text: str) -> str:
             codes = [generate_code(days=days, created_by=user_id) for _ in range(qty)]
             return "以下為新序號：\n" + "\n".join(codes)
 
+        if cmd == "試推播":
+            report = build_daily_report_for_user(user_id)
+            try:
+                push_text(user_id, report)
+                return "已推播測試訊息。"
+            except Exception as e:
+                return f"推播失敗：{e}"
+
     return "看不懂你的指令。\n\n" + help_text()
 
 
@@ -592,7 +726,7 @@ def handle_follow(event: FollowEvent):
         event.reply_token,
         (
             f"歡迎加入！你已獲得 {DEFAULT_TRIAL_DAYS} 天試用。\n"
-            f"目前已取消自動排程推播，可直接輸入「今日報告」查詢。\n\n"
+            f"目前採手動查詢模式，請直接輸入「今日報告」。\n\n"
             + help_text()
         ),
     )
@@ -620,14 +754,22 @@ def health():
 @app.post("/callback")
 async def callback(request: Request, x_line_signature: str = Header(None)):
     body = await request.body()
+    body_text = body.decode("utf-8")
+
     try:
-        handler.handle(body.decode("utf-8"), x_line_signature)
-    except InvalidSignatureError as e:
-        raise HTTPException(status_code=400, detail="Invalid signature") from e
+        if not x_line_signature:
+            raise HTTPException(status_code=400, detail="Missing X-Line-Signature")
+
+        handler.handle(body_text, x_line_signature)
+        return JSONResponse({"ok": True})
+
+    except InvalidSignatureError:
+        logger.exception("invalid signature")
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
     except Exception as e:
-        logger.exception("webhook error")
-        raise HTTPException(status_code=500, detail=str(e)) from e
-    return JSONResponse({"ok": True})
+        logger.exception("webhook error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.on_event("startup")
