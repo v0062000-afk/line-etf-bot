@@ -8,7 +8,6 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict, Any
 
 from dotenv import load_dotenv
-import pandas as pd
 import yfinance as yf
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -47,7 +46,6 @@ app = FastAPI(title="LINE ETF / 台股查詢機器人")
 handler = WebhookHandler(CHANNEL_SECRET)
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 
-# 你可以自己補充常查股票的題材
 THEME_MAP: Dict[str, List[str]] = {
     "0056": ["高股息", "ETF配息", "台股ETF"],
     "00878": ["高股息", "ETF配息", "台股ETF"],
@@ -342,102 +340,63 @@ def fear_label(value: Optional[int]) -> str:
 
 def get_fear_greed() -> Tuple[Optional[int], str]:
     try:
-        vix = yf.download("^VIX", period="10d", progress=False, auto_adjust=False, threads=False)
-        if vix is not None and not vix.empty:
-            close = vix["Close"].dropna()
+        vix_df = yf.Ticker("^VIX").history(period="10d", auto_adjust=False)
+        if vix_df is not None and not vix_df.empty:
+            close = vix_df["Close"].dropna()
             if not close.empty:
                 latest_vix = float(close.iloc[-1])
                 proxy_score = vix_to_fear_proxy(latest_vix)
                 return proxy_score, f"VIX fallback ({latest_vix:.2f})"
-    except Exception:
-        pass
+    except Exception as e:
+        logger.exception("VIX 抓取失敗: %s", e)
 
     return None, "unavailable"
 
 
-def _extract_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
-    if isinstance(df.columns, pd.MultiIndex):
-        if ("Close", ticker) in df.columns:
-            s = df[("Close", ticker)]
-        elif (ticker, "Close") in df.columns:
-            s = df[(ticker, "Close")]
-        else:
-            raise ValueError(f"{ticker} 找不到 Close 欄位")
-    else:
-        if "Close" not in df.columns:
-            raise ValueError(f"{ticker} 找不到 Close 欄位")
-        s = df["Close"]
+def get_price_data(symbol: str, lookback_days: int = 450) -> Dict[str, Any]:
+    sym = normalize_symbol(symbol)
+    tried = [f"{sym}.TW", f"{sym}.TWO"]
+    last_error = None
 
-    return s.dropna()
-
-
-def get_bulk_price_data(symbols: List[str], lookback_days: int = 450) -> Dict[str, Dict[str, Any]]:
-    result: Dict[str, Dict[str, Any]] = {}
-    if not symbols:
-        return result
-
-    normalized = [normalize_symbol(s) for s in symbols]
-
-    ticker_map: Dict[str, str] = {}
-    request_tickers: List[str] = []
-    for sym in normalized:
-        tw = f"{sym}.TW"
-        two = f"{sym}.TWO"
-        ticker_map[tw] = sym
-        ticker_map[two] = sym
-        request_tickers.extend([tw, two])
-
-    try:
-        df = yf.download(
-            tickers=" ".join(request_tickers),
-            period=f"{lookback_days}d",
-            progress=False,
-            auto_adjust=False,
-            group_by="column",
-            threads=False,
-        )
-    except Exception as e:
-        for sym in normalized:
-            result[sym] = {"error": str(e)}
-        return result
-
-    for sym in normalized:
-        found = False
-        for ticker in [f"{sym}.TW", f"{sym}.TWO"]:
-            try:
-                close = _extract_close_series(df, ticker)
-                if close.empty:
-                    continue
-
-                latest_dt = close.index[-1]
-                latest_price = float(close.iloc[-1])
-                ma30 = float(close.tail(30).mean()) if len(close) >= 30 else float(close.mean())
-                ma300 = float(close.tail(300).mean()) if len(close) >= 300 else float(close.mean())
-
-                try:
-                    latest_date = latest_dt.tz_localize(None).strftime("%Y-%m-%d")
-                except Exception:
-                    latest_date = latest_dt.strftime("%Y-%m-%d")
-
-                result[sym] = {
-                    "symbol": sym,
-                    "source_symbol": ticker,
-                    "close": round(latest_price, 2),
-                    "ma30": round(ma30, 2),
-                    "ma300": round(ma300, 2),
-                    "vs_ma30_pct": round((latest_price - ma30) / ma30 * 100, 2),
-                    "vs_ma300_pct": round((latest_price - ma300) / ma300 * 100, 2),
-                    "data_date": latest_date,
-                }
-                found = True
-                break
-            except Exception:
+    for ticker in tried:
+        try:
+            df = yf.Ticker(ticker).history(period=f"{lookback_days}d", auto_adjust=False)
+            if df is None or df.empty:
+                last_error = "empty dataframe"
                 continue
 
-        if not found:
-            result[sym] = {"error": f"抓不到 {sym} 資料"}
+            close = df["Close"].dropna()
+            if close.empty:
+                last_error = "empty close"
+                continue
 
-    return result
+            latest_dt = close.index[-1]
+            latest_price = float(close.iloc[-1])
+
+            ma30 = float(close.tail(30).mean()) if len(close) >= 30 else float(close.mean())
+            ma300 = float(close.tail(300).mean()) if len(close) >= 300 else float(close.mean())
+
+            try:
+                latest_date = latest_dt.tz_localize(None).strftime("%Y-%m-%d")
+            except Exception:
+                latest_date = latest_dt.strftime("%Y-%m-%d")
+
+            return {
+                "symbol": sym,
+                "source_symbol": ticker,
+                "close": round(latest_price, 2),
+                "ma30": round(ma30, 2),
+                "ma300": round(ma300, 2),
+                "vs_ma30_pct": round((latest_price - ma30) / ma30 * 100, 2),
+                "vs_ma300_pct": round((latest_price - ma300) / ma300 * 100, 2),
+                "data_date": latest_date,
+            }
+
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    raise ValueError(f"抓不到 {sym} 資料：{last_error or 'unknown error'}")
 
 
 def recommendation_for_stock(fear_value: Optional[int], data: Dict[str, Any], is_etf: bool = False) -> Tuple[str, str]:
@@ -468,10 +427,6 @@ def get_recent_theme(symbol: str) -> str:
 
 
 def estimate_major_holder_cost_zone(data: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    非真實大戶成交均價，為推估成本區。
-    以 30 日均線與 300 日均線做加權估算。
-    """
     ma30 = data["ma30"]
     ma300 = data["ma300"]
     close = data["close"]
@@ -539,13 +494,12 @@ def build_daily_report_for_user(user_id: str) -> str:
     if "0056" not in symbols:
         symbols = ["0056"] + symbols
 
-    price_map = get_bulk_price_data(symbols)
-
     extra_lines: List[str] = []
     for symbol in symbols:
-        data = price_map.get(symbol, {"error": f"抓不到 {symbol} 資料"})
-        if "error" in data:
-            extra_lines.append(f"📌 {symbol} 抓取失敗：{data['error']}")
+        try:
+            data = get_price_data(symbol)
+        except Exception as e:
+            extra_lines.append(f"📌 {symbol} 抓取失敗：{e}")
             continue
 
         if symbol == "0056":
