@@ -1,5 +1,4 @@
 import os
-from dotenv import load_dotenv
 import re
 import sqlite3
 import random
@@ -8,7 +7,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict, Any
 
-import requests
+from dotenv import load_dotenv
 import yfinance as yf
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
