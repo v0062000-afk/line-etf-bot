@@ -1,6 +1,7 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-line-bot-sdk==3.13.0
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+line-bot-sdk==3.17.1
 pandas==2.2.3
+python-dotenv==1.0.1
+requests==2.32.3
 yfinance==0.2.54
-twstock==1.4.0

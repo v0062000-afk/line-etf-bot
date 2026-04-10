@@ -1,416 +1,636 @@
 import os
-import json
+from dotenv import load_dotenv
+import re
+import sqlite3
+import random
+import string
 import logging
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+from typing import List, Optional, Tuple
 
-import pandas as pd
+import requests
 import yfinance as yf
-import twstock
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from zoneinfo import ZoneInfo
+
+from linebot.v3.messaging import (
+    ApiClient,
+    Configuration,
+    MessagingApi,
+    ReplyMessageRequest,
+    TextMessage,
+)
+from linebot.v3.webhook import WebhookHandler
+from linebot.v3.webhooks import FollowEvent, MessageEvent, TextMessageContent
+from linebot.v3.exceptions import InvalidSignatureError
+
+load_dotenv()
+
+TAIWAN_TZ = ZoneInfo("Asia/Taipei")
+DB_PATH = os.getenv("DB_PATH", "bot.db")
+ADMIN_USER_IDS = {x.strip() for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()}
+DEFAULT_TRIAL_DAYS = int(os.getenv("DEFAULT_TRIAL_DAYS", "7"))
+BASE_WATCHLIST = [x.strip() for x in os.getenv("BASE_WATCHLIST", "0056").split(",") if x.strip()]
+
+CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+
+if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
+    raise RuntimeError("請先設定 LINE_CHANNEL_SECRET 與 LINE_CHANNEL_ACCESS_TOKEN")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
-
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
-
-if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
-    logger.warning("LINE_CHANNEL_ACCESS_TOKEN 或 LINE_CHANNEL_SECRET 尚未設定")
-
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
-DATA_FILE = Path("user_stocks.json")
+app = FastAPI(title="LINE ETF 查詢機器人")
+handler = WebhookHandler(CHANNEL_SECRET)
+configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 
 
-# =========================
-# 使用者資料
-# =========================
-def load_data() -> Dict[str, List[str]]:
-    if not DATA_FILE.exists():
-        return {}
+def db_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    conn = db_conn()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            last_seen_at TEXT,
+            access_expires_at TEXT,
+            is_blocked INTEGER NOT NULL DEFAULT 0,
+            plan_name TEXT NOT NULL DEFAULT 'trial'
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(user_id, symbol)
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS redeem_codes (
+            code TEXT PRIMARY KEY,
+            days INTEGER NOT NULL,
+            max_uses INTEGER NOT NULL DEFAULT 1,
+            used_count INTEGER NOT NULL DEFAULT 0,
+            expires_at TEXT,
+            created_at TEXT NOT NULL,
+            created_by TEXT,
+            note TEXT
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS redemptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            redeemed_at TEXT NOT NULL,
+            days INTEGER NOT NULL
+        )
+        """
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def now_str() -> str:
+    return datetime.now(TAIWAN_TZ).isoformat()
+
+
+def parse_dt(text: Optional[str]) -> Optional[datetime]:
+    if not text:
+        return None
+    return datetime.fromisoformat(text)
+
+
+def normalize_symbol(symbol: str) -> str:
+    return symbol.strip().upper().replace(".TW", "").replace(".TWO", "")
+
+
+def ensure_user(user_id: str) -> None:
+    conn = db_conn()
+    cur = conn.cursor()
+    row = cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)).fetchone()
+
+    if row is None:
+        expires_at = (datetime.now(TAIWAN_TZ) + timedelta(days=DEFAULT_TRIAL_DAYS)).isoformat()
+        cur.execute(
+            """
+            INSERT INTO users (user_id, created_at, last_seen_at, access_expires_at, plan_name)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, now_str(), now_str(), expires_at, "trial"),
+        )
+
+        for symbol in BASE_WATCHLIST:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO subscriptions (user_id, symbol, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (user_id, normalize_symbol(symbol), now_str()),
+            )
+    else:
+        cur.execute(
+            "UPDATE users SET last_seen_at = ?, is_blocked = 0 WHERE user_id = ?",
+            (now_str(), user_id),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def user_status(user_id: str) -> Tuple[bool, Optional[datetime], str]:
+    conn = db_conn()
+    row = conn.execute(
+        "SELECT access_expires_at, plan_name FROM users WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return False, None, "unknown"
+
+    expires_at = parse_dt(row["access_expires_at"])
+    active = bool(expires_at and expires_at >= datetime.now(TAIWAN_TZ))
+    return active, expires_at, row["plan_name"]
+
+
+def add_subscription(user_id: str, symbol: str) -> str:
+    symbol = normalize_symbol(symbol)
+    conn = db_conn()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO subscriptions (user_id, symbol, created_at)
+        VALUES (?, ?, ?)
+        """,
+        (user_id, symbol, now_str()),
+    )
+    conn.commit()
+    conn.close()
+    return symbol
+
+
+def remove_subscription(user_id: str, symbol: str) -> str:
+    symbol = normalize_symbol(symbol)
+    conn = db_conn()
+    conn.execute("DELETE FROM subscriptions WHERE user_id = ? AND symbol = ?", (user_id, symbol))
+    conn.commit()
+    conn.close()
+    return symbol
+
+
+def get_subscriptions(user_id: str) -> List[str]:
+    conn = db_conn()
+    rows = conn.execute(
+        "SELECT symbol FROM subscriptions WHERE user_id = ? ORDER BY symbol ASC",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return [row["symbol"] for row in rows]
+
+
+def generate_code(
+    days: int,
+    note: str = "",
+    max_uses: int = 1,
+    expires_days: Optional[int] = None,
+    created_by: str = "",
+) -> str:
+    code = "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
+    expires_at = None
+
+    if expires_days:
+        expires_at = (datetime.now(TAIWAN_TZ) + timedelta(days=expires_days)).isoformat()
+
+    conn = db_conn()
+    conn.execute(
+        """
+        INSERT INTO redeem_codes
+        (code, days, max_uses, used_count, expires_at, created_at, created_by, note)
+        VALUES (?, ?, ?, 0, ?, ?, ?, ?)
+        """,
+        (code, days, max_uses, expires_at, now_str(), created_by, note),
+    )
+    conn.commit()
+    conn.close()
+    return code
+
+
+def redeem_code(user_id: str, code: str) -> Tuple[bool, str]:
+    conn = db_conn()
+    cur = conn.cursor()
+    code = code.strip().upper()
+
+    row = cur.execute("SELECT * FROM redeem_codes WHERE code = ?", (code,)).fetchone()
+    if not row:
+        conn.close()
+        return False, "查無此序號。"
+
+    expires_at = parse_dt(row["expires_at"])
+    if expires_at and expires_at < datetime.now(TAIWAN_TZ):
+        conn.close()
+        return False, "此序號已過期。"
+
+    if row["used_count"] >= row["max_uses"]:
+        conn.close()
+        return False, "此序號已被使用完畢。"
+
+    user_row = cur.execute(
+        "SELECT access_expires_at FROM users WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+
+    base = datetime.now(TAIWAN_TZ)
+    if user_row and user_row["access_expires_at"]:
+        current_expire = parse_dt(user_row["access_expires_at"])
+        if current_expire and current_expire > base:
+            base = current_expire
+
+    new_expire = base + timedelta(days=row["days"])
+
+    cur.execute(
+        "UPDATE users SET access_expires_at = ?, plan_name = ? WHERE user_id = ?",
+        (new_expire.isoformat(), f"paid_{row['days']}d", user_id),
+    )
+    cur.execute(
+        "UPDATE redeem_codes SET used_count = used_count + 1 WHERE code = ?",
+        (code,),
+    )
+    cur.execute(
+        """
+        INSERT INTO redemptions (code, user_id, redeemed_at, days)
+        VALUES (?, ?, ?, ?)
+        """,
+        (code, user_id, now_str(), row["days"]),
+    )
+    conn.commit()
+    conn.close()
+
+    return True, f"兌換成功，已延長 {row['days']} 天，到期日：{new_expire.strftime('%Y-%m-%d %H:%M')}"
+
+
+def vix_to_fear_proxy(vix_value: float) -> int:
+    if vix_value >= 40:
+        return 5
+    if vix_value >= 35:
+        return 10
+    if vix_value >= 30:
+        return 20
+    if vix_value >= 25:
+        return 30
+    if vix_value >= 20:
+        return 45
+    if vix_value >= 17:
+        return 55
+    if vix_value >= 14:
+        return 70
+    if vix_value >= 11:
+        return 82
+    return 90
+
+
+def fear_label(value: Optional[int]) -> str:
+    if value is None:
+        return "無法取得"
+    if value <= 24:
+        return "極度恐慌"
+    if value <= 44:
+        return "恐慌"
+    if value <= 54:
+        return "中性"
+    if value <= 74:
+        return "貪婪"
+    return "極度貪婪"
+
+
+def get_fear_greed() -> Tuple[Optional[int], str]:
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    cnn_urls = [
+        "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+        "https://production.dataviz.cnn.io/index/fearandgreed/graphdata/",
+    ]
+
+    for url in cnn_urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.ok and r.text.strip().startswith("{"):
+                data = r.json()
+                possible_paths = [
+                    ("fear_and_greed", "score"),
+                    ("fear_and_greed", "value"),
+                    ("score",),
+                    ("value",),
+                ]
+                for key_path in possible_paths:
+                    obj = data
+                    ok = True
+                    for key in key_path:
+                        if isinstance(obj, dict) and key in obj:
+                            obj = obj[key]
+                        else:
+                            ok = False
+                            break
+                    if ok and isinstance(obj, (int, float)):
+                        return int(round(obj)), "CNN Fear & Greed"
+        except Exception:
+            pass
 
     try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except Exception as e:
-        logger.exception(f"讀取 user_stocks.json 失敗: {e}")
-        return {}
-
-
-def save_data(data: Dict[str, List[str]]) -> None:
-    try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.exception(f"寫入 user_stocks.json 失敗: {e}")
-
-
-def get_user_stocks(user_id: str) -> List[str]:
-    data = load_data()
-    return data.get(user_id, [])
-
-
-def add_user_stock(user_id: str, stock_no: str) -> str:
-    data = load_data()
-    stocks = data.get(user_id, [])
-
-    if stock_no in stocks:
-        return f"股票 {stock_no} 已經在你的自選清單裡了"
-
-    stocks.append(stock_no)
-    data[user_id] = stocks
-    save_data(data)
-    return f"已新增股票 {stock_no}"
-
-
-def remove_user_stock(user_id: str, stock_no: str) -> str:
-    data = load_data()
-    stocks = data.get(user_id, [])
-
-    if stock_no not in stocks:
-        return f"你的自選清單沒有 {stock_no}"
-
-    stocks.remove(stock_no)
-    data[user_id] = stocks
-    save_data(data)
-    return f"已刪除股票 {stock_no}"
-
-
-# =========================
-# 股票名稱
-# =========================
-def get_stock_name(stock_no: str) -> str:
-    try:
-        if stock_no in twstock.codes:
-            return twstock.codes[stock_no].name
+        vix_df = yf.Ticker("^VIX").history(period="10d", auto_adjust=False)
+        if vix_df is not None and not vix_df.empty:
+            close = vix_df["Close"].dropna()
+            if not close.empty:
+                latest_vix = float(close.iloc[-1])
+                proxy_score = vix_to_fear_proxy(latest_vix)
+                return proxy_score, f"VIX fallback ({latest_vix:.2f})"
     except Exception:
         pass
-    return stock_no
+
+    return None, "unavailable"
 
 
-# =========================
-# 股票資料
-# =========================
-def fetch_from_twstock(stock_no: str) -> Optional[dict]:
-    try:
-        stock = twstock.Stock(stock_no)
-        data = stock.fetch_from(2024, 1)
+def get_price_data(symbol: str, lookback_days: int = 450) -> dict:
+    sym = normalize_symbol(symbol)
+    tried = [f"{sym}.TW", f"{sym}.TWO"]
+    hist = None
+    last_error = None
 
-        if not data:
-            return None
-
-        closes = []
-        dates = []
-
-        for item in data:
-            if item.close is not None:
-                closes.append(float(item.close))
-                dates.append(item.date)
-
-        if not closes:
-            return None
-
-        close_series = pd.Series(closes, dtype="float64")
-        close_price = float(close_series.iloc[-1])
-        trade_date = dates[-1].strftime("%Y-%m-%d")
-
-        ma30 = close_series.rolling(30).mean().iloc[-1] if len(close_series) >= 30 else None
-        ma200 = close_series.rolling(200).mean().iloc[-1] if len(close_series) >= 200 else None
-
-        diff30 = ((close_price - ma30) / ma30 * 100) if pd.notna(ma30) and ma30 != 0 else None
-        diff200 = ((close_price - ma200) / ma200 * 100) if pd.notna(ma200) and ma200 != 0 else None
-
-        return {
-            "trade_date": trade_date,
-            "close": round(close_price, 2),
-            "ma30": round(float(ma30), 2) if pd.notna(ma30) else None,
-            "ma200": round(float(ma200), 2) if pd.notna(ma200) else None,
-            "diff30": round(float(diff30), 2) if diff30 is not None else None,
-            "diff200": round(float(diff200), 2) if diff200 is not None else None,
-            "source": "twstock",
-        }
-
-    except Exception as e:
-        logger.exception(f"twstock 抓取失敗 {stock_no}: {e}")
-        return None
-
-
-def fetch_from_yfinance(stock_no: str) -> Optional[dict]:
-    candidates = [f"{stock_no}.TW", f"{stock_no}.TWO"]
-
-    for symbol in candidates:
+    for candidate in tried:
         try:
-            df = yf.download(
-                symbol,
-                period="400d",
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-                threads=False,
-            )
-
-            if df is None or df.empty:
-                continue
-
-            if "Close" not in df.columns:
-                continue
-
-            close_col = df["Close"]
-            if isinstance(close_col, pd.DataFrame):
-                close_col = close_col.iloc[:, 0]
-
-            close_col = close_col.dropna()
-            if close_col.empty:
-                continue
-
-            close_price = float(close_col.iloc[-1])
-            trade_date = str(close_col.index[-1])[:10]
-
-            ma30 = close_col.rolling(30).mean().iloc[-1] if len(close_col) >= 30 else None
-            ma200 = close_col.rolling(200).mean().iloc[-1] if len(close_col) >= 200 else None
-
-            diff30 = ((close_price - ma30) / ma30 * 100) if pd.notna(ma30) and ma30 != 0 else None
-            diff200 = ((close_price - ma200) / ma200 * 100) if pd.notna(ma200) and ma200 != 0 else None
-
-            return {
-                "trade_date": trade_date,
-                "close": round(close_price, 2),
-                "ma30": round(float(ma30), 2) if pd.notna(ma30) else None,
-                "ma200": round(float(ma200), 2) if pd.notna(ma200) else None,
-                "diff30": round(float(diff30), 2) if diff30 is not None else None,
-                "diff200": round(float(diff200), 2) if diff200 is not None else None,
-                "source": "yfinance",
-            }
-
+            df = yf.Ticker(candidate).history(period=f"{lookback_days}d", auto_adjust=False)
+            if df is not None and not df.empty:
+                hist = df.copy()
+                break
         except Exception as e:
-            logger.exception(f"yfinance 抓取失敗 {stock_no} {symbol}: {e}")
+            last_error = str(e)
 
-    return None
+    if hist is None or hist.empty:
+        raise ValueError(f"抓不到 {sym} 資料：{last_error or 'empty'}")
 
+    close = hist["Close"].dropna()
+    latest_price = float(close.iloc[-1])
+    ma30 = float(close.tail(30).mean()) if len(close) >= 30 else float(close.mean())
+    ma300 = float(close.tail(300).mean()) if len(close) >= 300 else float(close.mean())
 
-def fetch_stock_data(stock_no: str) -> dict:
-    data = fetch_from_twstock(stock_no)
-    if data:
-        return data
-
-    data = fetch_from_yfinance(stock_no)
-    if data:
-        return data
-
-    raise ValueError(f"抓不到股票 {stock_no} 的資料")
-
-
-# =========================
-# 推薦邏輯
-# =========================
-def recommendation_text(diff30: Optional[float], diff200: Optional[float]) -> Tuple[str, str]:
-    if diff30 is None:
-        return "⚪ 暫無法判斷", "資料不足"
-
-    if diff30 < -8:
-        return "🟢 可留意", "價格低於30日均線較多，可觀察是否止跌"
-
-    if -8 <= diff30 <= 3:
-        if diff200 is not None and diff200 < 15:
-            return "🟢 可小量布局", "價格接近均線附近，可小量定期投入"
-        return "🟡 可觀察", "短線接近30日均線，但離長均線仍有距離"
-
-    if 3 < diff30 <= 10:
-        return "🟡 不宜追高", "價格高於30日均線，建議等拉回"
-
-    return "🔴 偏熱", "價格離30日均線過遠，短線不建議追價"
+    return {
+        "symbol": sym,
+        "close": round(latest_price, 2),
+        "ma30": round(ma30, 2),
+        "ma300": round(ma300, 2),
+        "vs_ma30_pct": round((latest_price - ma30) / ma30 * 100, 2),
+        "vs_ma300_pct": round((latest_price - ma300) / ma300 * 100, 2),
+    }
 
 
-def format_stock_report(stock_no: str) -> str:
-    try:
-        data = fetch_stock_data(stock_no)
-        stock_name = get_stock_name(stock_no)
-        suggest, reason = recommendation_text(data["diff30"], data["diff200"])
+def recommendation_for_0056(fear_value: Optional[int], data: dict) -> Tuple[str, str]:
+    diff30 = data["vs_ma30_pct"]
+    diff300 = data["vs_ma300_pct"]
 
-        lines = []
-        lines.append(f"📌 {stock_no} {stock_name} 重點：")
-        lines.append(f"最近交易日收盤價：{data['close']}")
-        lines.append(f"交易日：{data['trade_date']}")
-        lines.append(f"近30天平均價：{data['ma30'] if data['ma30'] is not None else '暫無資料'}")
-        lines.append(f"近200天平均價：{data['ma200'] if data['ma200'] is not None else '暫無資料'}")
-        lines.append(f"與30日均差距：{str(data['diff30']) + '%' if data['diff30'] is not None else '暫無資料'}")
-        lines.append(f"與200日均差距：{str(data['diff200']) + '%' if data['diff200'] is not None else '暫無資料'}")
-        lines.append(f"是否建議加碼：{suggest}")
-        lines.append(f"原因：{reason}")
-        lines.append(f"資料來源：{data['source']}")
-        return "\n".join(lines)
+    if fear_value is not None and fear_value < 25 and diff30 <= -3:
+        return "🔥 強烈加碼", "恐慌明顯，且價格低於近30日均線 3% 以上。"
 
-    except Exception as e:
-        logger.exception(f"format_stock_report 失敗 stock_no={stock_no}, error={e}")
-        return f"📌 {stock_no} 重點：\n資料取得失敗：{e}"
+    if (fear_value is not None and fear_value < 30 and diff30 <= 0) or diff300 <= -5:
+        return "🟡 可分批加碼", "情緒偏弱且價格不高，可分批布局。"
+
+    if diff30 > 3 and diff300 > 8:
+        return "⚠️ 先觀望", "股價高於短中期均線較多，先保留現金。"
+
+    return "🟢 可小量布局", "價格接近均線附近，可小量定期投入。"
 
 
-def build_market_summary() -> str:
-    lines = []
-    lines.append("📊 每日投資提醒")
-    lines.append("")
-    lines.append("⚠️ 提醒：以下價格為最近交易日收盤資料，不一定是當下即時價。")
-    return "\n".join(lines)
+def general_stock_summary(data: dict) -> str:
+    return (
+        f"📌 {data['symbol']} 重點：\n"
+        f"收盤價：{data['close']}\n"
+        f"近30天平均價：{data['ma30']}\n"
+        f"近300天平均價：{data['ma300']}\n"
+        f"與30日均差距：{data['vs_ma30_pct']}%\n"
+        f"與300日均差距：{data['vs_ma300_pct']}%"
+    )
 
 
-def build_today_report(user_id: str) -> str:
-    stocks = get_user_stocks(user_id)
+def build_daily_report_for_user(user_id: str) -> str:
+    fear_value, fg_source = get_fear_greed()
 
-    lines = []
-    lines.append(build_market_summary())
-    lines.append("")
+    lines = [
+        f"📊 每日投資提醒（{datetime.now(TAIWAN_TZ).strftime('%Y/%m/%d %H:%M')}）",
+        "",
+    ]
 
-    if stocks:
-        lines.append("👀 你的自選股票：")
-        for stock_no in stocks:
-            lines.append(format_stock_report(stock_no))
-            lines.append("")
+    if fg_source.startswith("VIX fallback"):
+        lines.extend(
+            [
+                f"😱 市場情緒代理值：{fear_value if fear_value is not None else 'N/A'}（{fear_label(fear_value)}）",
+                f"資料來源：{fg_source}",
+                "",
+            ]
+        )
     else:
-        lines.append("你目前還沒有自選股票。")
-        lines.append("可輸入：新增股票 2330")
+        lines.extend(
+            [
+                f"😱 恐慌指數：{fear_value if fear_value is not None else 'N/A'}（{fear_label(fear_value)}）",
+                f"資料來源：{fg_source}",
+                "",
+            ]
+        )
+
+    symbols = get_subscriptions(user_id)
+    if "0056" not in symbols:
+        symbols = ["0056"] + symbols
+
+    summary_lines = []
+    for symbol in symbols:
+        try:
+            data = get_price_data(symbol)
+            if symbol == "0056":
+                rec, reason = recommendation_for_0056(fear_value, data)
+                lines.extend(
+                    [
+                        "📈 0056 重點：",
+                        f"收盤價：{data['close']}",
+                        f"近30天平均價：{data['ma30']}",
+                        f"近300天平均價：{data['ma300']}",
+                        f"與30日均差距：{data['vs_ma30_pct']}%",
+                        f"與300日均差距：{data['vs_ma300_pct']}%",
+                        f"是否建議加碼：{rec}",
+                        f"原因：{reason}",
+                        "",
+                    ]
+                )
+            else:
+                summary_lines.append(general_stock_summary(data))
+        except Exception as e:
+            summary_lines.append(f"📌 {symbol} 抓取失敗：{e}")
+
+    if summary_lines:
+        lines.append("👀 你的自選股票：")
+        lines.extend(summary_lines)
         lines.append("")
 
-    lines.append("可用指令：")
-    lines.append("新增股票 2330")
-    lines.append("刪除股票 2330")
-    lines.append("我的股票")
-    lines.append("今日報告")
-    lines.append("查ID")
-    lines.append("狀態")
+    lines.extend(
+        [
+            "可用指令：",
+            "今日報告",
+            "新增股票 2330",
+            "刪除股票 2330",
+            "我的股票",
+            "狀態",
+            "兌換 ABCD123456",
+        ]
+    )
 
-    return "\n".join(lines).strip()
-
-
-def build_stock_list_text(user_id: str) -> str:
-    stocks = get_user_stocks(user_id)
-    if not stocks:
-        return "你目前沒有自選股票，可輸入：新增股票 2330"
-
-    lines = ["📋 你的自選股票："]
-    for s in stocks:
-        lines.append(f"- {s} {get_stock_name(s)}")
     return "\n".join(lines)
 
 
-# =========================
-# FastAPI routes
-# =========================
+def reply_message(reply_token: str, text: str) -> None:
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        api.reply_message(
+            ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[TextMessage(text=text)],
+            )
+        )
+
+
+def help_text() -> str:
+    return (
+        "可用指令：\n"
+        "1) 今日報告\n"
+        "2) 新增股票 2330\n"
+        "3) 刪除股票 2330\n"
+        "4) 我的股票\n"
+        "5) 狀態\n"
+        "6) 兌換 ABCD123456\n"
+        "\n"
+        "管理者指令：\n"
+        "7) 產生序號 30\n"
+        "8) 產生序號 30 5\n"
+        "9) 查ID"
+    )
+
+
+def handle_text_command(user_id: str, text: str) -> str:
+    cmd = text.strip()
+    active, expires_at, plan_name = user_status(user_id)
+
+    if cmd in {"help", "幫助", "說明", "menu", "選單"}:
+        return help_text()
+
+    if cmd == "查ID":
+        return f"你的 LINE USER ID：{user_id}"
+
+    if cmd in {"狀態", "我的狀態"}:
+        return (
+            f"方案：{plan_name}\n"
+            f"到期：{expires_at.strftime('%Y-%m-%d %H:%M') if expires_at else '未設定'}\n"
+            f"目前狀態：{'可使用' if active else '已過期，請兌換序號'}"
+        )
+
+    if cmd == "我的股票":
+        symbols = get_subscriptions(user_id)
+        return "你的股票：" + ("、".join(symbols) if symbols else "尚未設定")
+
+    if cmd in {"今日報告", "今日", "report"}:
+        if not active:
+            return "你的使用期限已到，請先輸入：兌換 序號"
+        return build_daily_report_for_user(user_id)
+
+    m = re.match(r"^新增股票\s+([0-9A-Za-z]{2,10})$", cmd)
+    if m:
+        symbol = add_subscription(user_id, m.group(1))
+        return f"已加入 {symbol} 到查詢清單。"
+
+    m = re.match(r"^刪除股票\s+([0-9A-Za-z]{2,10})$", cmd)
+    if m:
+        symbol = remove_subscription(user_id, m.group(1))
+        return f"已刪除 {symbol}。"
+
+    m = re.match(r"^兌換\s+([A-Za-z0-9]{6,20})$", cmd)
+    if m:
+        ok, msg = redeem_code(user_id, m.group(1))
+        return msg
+
+    if user_id in ADMIN_USER_IDS:
+        m = re.match(r"^產生序號\s+(\d{1,4})(?:\s+(\d{1,3}))?$", cmd)
+        if m:
+            days = int(m.group(1))
+            qty = int(m.group(2) or 1)
+            codes = [generate_code(days=days, created_by=user_id) for _ in range(qty)]
+            return "以下為新序號：\n" + "\n".join(codes)
+
+    return "看不懂你的指令。\n\n" + help_text()
+
+
+@handler.add(FollowEvent)
+def handle_follow(event: FollowEvent):
+    user_id = event.source.user_id
+    ensure_user(user_id)
+    reply_message(
+        event.reply_token,
+        (
+            f"歡迎加入！你已獲得 {DEFAULT_TRIAL_DAYS} 天試用。\n"
+            f"目前已取消自動排程推播，可直接輸入「今日報告」查詢。\n\n"
+            + help_text()
+        ),
+    )
+
+
+@handler.add(MessageEvent, message=TextMessageContent)
+def handle_message(event: MessageEvent):
+    user_id = event.source.user_id
+    ensure_user(user_id)
+    text = event.message.text
+    response = handle_text_command(user_id, text)
+    reply_message(event.reply_token, response)
+
+
 @app.get("/")
-async def home():
-    return {"status": "ok", "message": "AI Stock Bot is running"}
+def root():
+    return {"ok": True, "message": "LINE ETF bot running"}
 
 
 @app.get("/health")
-async def health():
-    return {"status": "healthy"}
+def health():
+    return {"ok": True, "time": now_str()}
 
 
-@app.post("/webhook")
-async def webhook(request: Request):
-    if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
-        raise HTTPException(status_code=500, detail="LINE 環境變數未設定")
-
-    signature = request.headers.get("X-Line-Signature", "")
+@app.post("/callback")
+async def callback(request: Request, x_line_signature: str = Header(None)):
     body = await request.body()
-    body_text = body.decode("utf-8")
-
-    logger.info(f"Webhook body: {body_text}")
-
     try:
-        handler.handle(body_text, signature)
-    except InvalidSignatureError:
-        logger.error("Invalid signature")
-        raise HTTPException(status_code=400, detail="Invalid signature")
+        handler.handle(body.decode("utf-8"), x_line_signature)
+    except InvalidSignatureError as e:
+        raise HTTPException(status_code=400, detail="Invalid signature") from e
     except Exception as e:
-        logger.exception(f"Webhook 發生錯誤: {e}")
-        raise HTTPException(status_code=500, detail="Webhook error")
+        logger.exception("webhook error")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return JSONResponse({"ok": True})
 
-    return JSONResponse(content={"status": "ok"})
 
-
-# =========================
-# LINE message handler
-# =========================
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event: MessageEvent):
-    user_id = "unknown_user"
-    text = ""
-
-    try:
-        user_id = event.source.user_id if event.source and event.source.user_id else "unknown_user"
-        text = event.message.text.strip()
-
-        logger.info(f"收到訊息 user_id={user_id}, text={text}")
-
-        if text == "查ID":
-            reply_text = f"你的 User ID：\n{user_id}"
-
-        elif text == "狀態":
-            reply_text = "✅ 機器人目前正常運作中"
-
-        elif text == "我的股票":
-            reply_text = build_stock_list_text(user_id)
-
-        elif text == "今日報告":
-            reply_text = build_today_report(user_id)
-
-        elif text.startswith("新增股票"):
-            parts = text.split()
-            if len(parts) != 2:
-                reply_text = "格式錯誤，請輸入：新增股票 2330"
-            else:
-                stock_no = parts[1].strip()
-                if not stock_no.isdigit():
-                    reply_text = "股票代碼格式錯誤，請輸入數字，例如：新增股票 2330"
-                else:
-                    reply_text = add_user_stock(user_id, stock_no)
-
-        elif text.startswith("刪除股票"):
-            parts = text.split()
-            if len(parts) != 2:
-                reply_text = "格式錯誤，請輸入：刪除股票 2330"
-            else:
-                stock_no = parts[1].strip()
-                if not stock_no.isdigit():
-                    reply_text = "股票代碼格式錯誤，請輸入數字，例如：刪除股票 2330"
-                else:
-                    reply_text = remove_user_stock(user_id, stock_no)
-
-        else:
-            reply_text = (
-                "你可以使用以下指令：\n"
-                "新增股票 2330\n"
-                "刪除股票 2330\n"
-                "我的股票\n"
-                "今日報告\n"
-                "查ID\n"
-                "狀態"
-            )
-
-        logger.info(f"準備回覆: {reply_text[:1000]}")
-
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=reply_text)
-        )
-
-        logger.info("reply_message 成功")
-
-    except Exception as e:
-        logger.exception(f"handle_message 發生錯誤, text={text}, user_id={user_id}, error={e}")
-        try:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="系統暫時發生錯誤，請稍後再試")
-            )
-        except Exception as inner_e:
-            logger.exception(f"回覆錯誤訊息也失敗: {inner_e}")
+@app.on_event("startup")
+def startup_event():
+    init_db()
+    logger.info("Application startup complete")
