@@ -43,9 +43,24 @@ if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LINE ETF 查詢機器人")
+app = FastAPI(title="LINE ETF / 台股查詢機器人")
 handler = WebhookHandler(CHANNEL_SECRET)
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+
+# 你可以自己補充常查股票的題材
+THEME_MAP: Dict[str, List[str]] = {
+    "0056": ["高股息", "ETF配息", "台股ETF"],
+    "00878": ["高股息", "ETF配息", "台股ETF"],
+    "0050": ["市值型ETF", "權值股", "台股ETF"],
+    "006208": ["市值型ETF", "權值股", "台股ETF"],
+    "1815": ["不鏽鋼", "原物料", "傳產"],
+    "2330": ["AI", "半導體", "CoWoS"],
+    "2317": ["AI伺服器", "組裝", "電動車"],
+    "2382": ["AI伺服器", "筆電", "電子代工"],
+    "3231": ["BBU", "AI伺服器電源", "電池備援"],
+    "3017": ["AI伺服器", "散熱", "機殼"],
+    "6669": ["半導體設備", "先進封裝", "CoWoS"],
+}
 
 
 def db_conn() -> sqlite3.Connection:
@@ -126,11 +141,6 @@ def parse_dt(text: Optional[str]) -> Optional[datetime]:
 
 def normalize_symbol(symbol: str) -> str:
     return symbol.strip().upper().replace(".TW", "").replace(".TWO", "")
-
-
-def tw_yf_symbol(symbol: str) -> List[str]:
-    s = normalize_symbol(symbol)
-    return [f"{s}.TW", f"{s}.TWO"]
 
 
 def ensure_user(user_id: str) -> None:
@@ -363,7 +373,6 @@ def _extract_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
 
 def get_bulk_price_data(symbols: List[str], lookback_days: int = 450) -> Dict[str, Dict[str, Any]]:
     result: Dict[str, Dict[str, Any]] = {}
-
     if not symbols:
         return result
 
@@ -402,7 +411,6 @@ def get_bulk_price_data(symbols: List[str], lookback_days: int = 450) -> Dict[st
 
                 latest_dt = close.index[-1]
                 latest_price = float(close.iloc[-1])
-
                 ma30 = float(close.tail(30).mean()) if len(close) >= 30 else float(close.mean())
                 ma300 = float(close.tail(300).mean()) if len(close) >= 300 else float(close.mean())
 
@@ -432,7 +440,7 @@ def get_bulk_price_data(symbols: List[str], lookback_days: int = 450) -> Dict[st
     return result
 
 
-def recommendation_for_0056(fear_value: Optional[int], data: Dict[str, Any]) -> Tuple[str, str]:
+def recommendation_for_stock(fear_value: Optional[int], data: Dict[str, Any], is_etf: bool = False) -> Tuple[str, str]:
     diff30 = data["vs_ma30_pct"]
     diff300 = data["vs_ma300_pct"]
 
@@ -442,20 +450,63 @@ def recommendation_for_0056(fear_value: Optional[int], data: Dict[str, Any]) -> 
     if (fear_value is not None and fear_value < 35 and diff30 <= 0) or diff300 <= -5:
         return "🟡 可分批加碼", "情緒偏弱或價格回到均線附近，可分批布局。"
 
-    if diff30 > 3 and diff300 > 8:
+    if diff30 > 6 and diff300 > 15 and not is_etf:
+        return "⚠️ 先觀望", "股價已明顯高於短中期均線，追價風險較高。"
+
+    if diff30 > 3 and diff300 > 8 and is_etf:
         return "⚠️ 先觀望", "價格高於短中期均線較多，先保留資金。"
 
     return "🟢 可小量布局", "價格接近均線附近，可小量定期投入。"
 
 
-def general_stock_summary(data: Dict[str, Any]) -> str:
+def get_recent_theme(symbol: str) -> str:
+    sym = normalize_symbol(symbol)
+    themes = THEME_MAP.get(sym)
+    if themes:
+        return "、".join(themes)
+    return "暫無預設題材"
+
+
+def estimate_major_holder_cost_zone(data: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    非真實大戶成交均價，為推估成本區。
+    以 30 日均線與 300 日均線做加權估算。
+    """
+    ma30 = data["ma30"]
+    ma300 = data["ma300"]
+    close = data["close"]
+
+    center = ma30 * 0.7 + ma300 * 0.3
+    low = center * 0.97
+    high = center * 1.03
+
+    if close < low:
+        desc = "股價低於成本區附近"
+    elif close > high:
+        desc = "股價高於成本區附近"
+    else:
+        desc = "股價接近成本區"
+
+    return f"{low:.2f} ~ {high:.2f}", desc
+
+
+def general_stock_summary(data: Dict[str, Any], fear_value: Optional[int]) -> str:
+    rec, reason = recommendation_for_stock(fear_value, data, is_etf=False)
+    themes = get_recent_theme(data["symbol"])
+    cost_zone, cost_desc = estimate_major_holder_cost_zone(data)
+
     return (
         f"📌 {data['symbol']} 重點：\n"
         f"收盤價：{data['close']}\n"
         f"近30天平均價：{data['ma30']}\n"
         f"近300天平均價：{data['ma300']}\n"
         f"與30日均差距：{data['vs_ma30_pct']}%\n"
-        f"與300日均差距：{data['vs_ma300_pct']}%"
+        f"與300日均差距：{data['vs_ma300_pct']}%\n"
+        f"是否建議加碼：{rec}\n"
+        f"原因：{reason}\n"
+        f"近期題材：{themes}\n"
+        f"大戶成本區推估：{cost_zone}\n"
+        f"成本區判斷：{cost_desc}"
     )
 
 
@@ -498,7 +549,10 @@ def build_daily_report_for_user(user_id: str) -> str:
             continue
 
         if symbol == "0056":
-            rec, reason = recommendation_for_0056(fear_value, data)
+            rec, reason = recommendation_for_stock(fear_value, data, is_etf=True)
+            themes = get_recent_theme(symbol)
+            cost_zone, cost_desc = estimate_major_holder_cost_zone(data)
+
             lines.extend(
                 [
                     "📈 0056 重點：",
@@ -508,12 +562,15 @@ def build_daily_report_for_user(user_id: str) -> str:
                     f"與30日均差距：{data['vs_ma30_pct']}%",
                     f"與300日均差距：{data['vs_ma300_pct']}%",
                     f"是否建議加碼：{rec}",
-                    f"原因：價格接近均線附近，可小量定期投入。" if rec == "🟢 可小量布局" else f"原因：{reason}",
+                    f"原因：{reason}",
+                    f"近期題材：{themes}",
+                    f"大戶成本區推估：{cost_zone}",
+                    f"成本區判斷：{cost_desc}",
                     "",
                 ]
             )
         else:
-            extra_lines.append(general_stock_summary(data))
+            extra_lines.append(general_stock_summary(data, fear_value))
 
     if extra_lines:
         lines.append("👀 你的自選股票：")
