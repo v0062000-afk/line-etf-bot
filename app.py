@@ -6,15 +6,13 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import yfinance as yf
+import twstock
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
-# =========================
-# 基本設定
-# =========================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -33,18 +31,15 @@ DATA_FILE = Path("user_stocks.json")
 
 
 # =========================
-# 使用者資料存取
+# 使用者資料
 # =========================
 def load_data() -> Dict[str, List[str]]:
     if not DATA_FILE.exists():
         return {}
-
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, dict):
-                return data
-            return {}
+            return data if isinstance(data, dict) else {}
     except Exception as e:
         logger.exception(f"讀取 user_stocks.json 失敗: {e}")
         return {}
@@ -90,170 +85,174 @@ def remove_user_stock(user_id: str, stock_no: str) -> str:
 
 
 # =========================
+# 股票名稱
+# =========================
+def get_stock_name(stock_no: str) -> str:
+    try:
+        if stock_no in twstock.codes:
+            return twstock.codes[stock_no].name
+    except Exception:
+        pass
+    return stock_no
+
+
+# =========================
 # 股票資料
 # =========================
-def normalize_to_taipei_index(df: pd.DataFrame) -> pd.DataFrame:
+def fetch_from_twstock(stock_no: str) -> Optional[dict]:
     """
-    將 yfinance 回傳的 index 統一轉成 Asia/Taipei，避免日期少一天。
-    """
-    if df.empty:
-        return df
-
-    idx = pd.to_datetime(df.index)
-
-    if getattr(idx, "tz", None) is None:
-        idx = idx.tz_localize("UTC").tz_convert("Asia/Taipei")
-    else:
-        idx = idx.tz_convert("Asia/Taipei")
-
-    df = df.copy()
-    df.index = idx
-    return df
-
-
-def pick_scalar(value) -> Optional[float]:
-    """
-    處理 yfinance 偶爾回傳 Series / ndarray / scalar 的情況，只取最後一個值。
+    優先用 twstock 抓台股 / ETF
     """
     try:
-        if isinstance(value, pd.Series):
-            value = value.iloc[-1]
-        elif isinstance(value, pd.DataFrame):
-            value = value.iloc[-1, -1]
+        stock = twstock.Stock(stock_no)
+        data = stock.fetch_from(2024, 1)  # 抓久一點，方便算200日均線
 
-        if hasattr(value, "item"):
-            try:
-                value = value.item()
-            except Exception:
-                pass
-
-        if pd.isna(value):
+        if not data:
             return None
 
-        return float(value)
-    except Exception:
+        closes = []
+        dates = []
+
+        for item in data:
+            if item.close is not None:
+                closes.append(float(item.close))
+                dates.append(item.date)
+
+        if not closes:
+            return None
+
+        close_series = pd.Series(closes, dtype="float64")
+        close_price = float(close_series.iloc[-1])
+        trade_date = dates[-1].strftime("%Y-%m-%d")
+
+        ma30 = close_series.rolling(30).mean().iloc[-1] if len(close_series) >= 30 else None
+        ma200 = close_series.rolling(200).mean().iloc[-1] if len(close_series) >= 200 else None
+
+        diff30 = ((close_price - ma30) / ma30 * 100) if pd.notna(ma30) and ma30 != 0 else None
+        diff200 = ((close_price - ma200) / ma200 * 100) if pd.notna(ma200) and ma200 != 0 else None
+
+        return {
+            "trade_date": trade_date,
+            "close": round(close_price, 2),
+            "ma30": round(float(ma30), 2) if pd.notna(ma30) else None,
+            "ma200": round(float(ma200), 2) if pd.notna(ma200) else None,
+            "diff30": round(float(diff30), 2) if diff30 is not None else None,
+            "diff200": round(float(diff200), 2) if diff200 is not None else None,
+            "source": "twstock",
+        }
+
+    except Exception as e:
+        logger.exception(f"twstock 抓取失敗 {stock_no}: {e}")
         return None
 
 
-def download_stock_df(symbol: str) -> pd.DataFrame:
+def fetch_from_yfinance(stock_no: str) -> Optional[dict]:
     """
-    下載日K資料。
-    """
-    df = yf.download(
-        symbol,
-        period="400d",
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-    )
-
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    df = normalize_to_taipei_index(df)
-    return df
-
-
-def fetch_stock_data(stock_no: str) -> Dict[str, Optional[float]]:
-    """
-    回傳股票最近交易日的資料。
-    會先試 .TW，再試 .TWO
+    twstock 抓不到時，再用 yfinance 補
     """
     candidates = [f"{stock_no}.TW", f"{stock_no}.TWO"]
-    last_error = None
 
     for symbol in candidates:
         try:
-            df = download_stock_df(symbol)
-            if df.empty:
+            df = yf.download(
+                symbol,
+                period="400d",
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+
+            if df is None or df.empty:
                 continue
 
             if "Close" not in df.columns:
                 continue
 
-            close_series = df["Close"].copy()
-            if isinstance(close_series, pd.DataFrame):
-                close_series = close_series.iloc[:, 0]
+            close_col = df["Close"]
+            if isinstance(close_col, pd.DataFrame):
+                close_col = close_col.iloc[:, 0]
 
-            df = df.copy()
-            df["Close_1D"] = close_series
-            df = df.dropna(subset=["Close_1D"])
-
-            if df.empty:
+            close_col = close_col.dropna()
+            if close_col.empty:
                 continue
 
-            df["MA30"] = df["Close_1D"].rolling(30).mean()
-            df["MA300"] = df["Close_1D"].rolling(300).mean()
+            close_price = float(close_col.iloc[-1])
 
-            last_row = df.iloc[-1]
+            ma30 = close_col.rolling(30).mean().iloc[-1] if len(close_col) >= 30 else None
+            ma200 = close_col.rolling(200).mean().iloc[-1] if len(close_col) >= 200 else None
 
-            close_price = pick_scalar(last_row["Close_1D"])
-            ma30 = pick_scalar(last_row["MA30"])
-            ma300 = pick_scalar(last_row["MA300"])
+            diff30 = ((close_price - ma30) / ma30 * 100) if pd.notna(ma30) and ma30 != 0 else None
+            diff200 = ((close_price - ma200) / ma200 * 100) if pd.notna(ma200) and ma200 != 0 else None
 
-            if close_price is None:
-                continue
-
-            diff30 = ((close_price - ma30) / ma30 * 100) if ma30 not in (None, 0) else None
-            diff300 = ((close_price - ma300) / ma300 * 100) if ma300 not in (None, 0) else None
-
-            trade_date = df.index[-1].strftime("%Y-%m-%d")
-
-            logger.info(
-                f"stock={stock_no}, symbol={symbol}, trade_date={trade_date}, "
-                f"close={close_price}, ma30={ma30}, ma300={ma300}"
-            )
+            trade_date = str(close_col.index[-1])[:10]
 
             return {
-                "stock_no": stock_no,
-                "symbol": symbol,
                 "trade_date": trade_date,
                 "close": round(close_price, 2),
-                "ma30": round(ma30, 2) if ma30 is not None else None,
-                "ma300": round(ma300, 2) if ma300 is not None else None,
-                "diff30": round(diff30, 2) if diff30 is not None else None,
-                "diff300": round(diff300, 2) if diff300 is not None else None,
+                "ma30": round(float(ma30), 2) if pd.notna(ma30) else None,
+                "ma200": round(float(ma200), 2) if pd.notna(ma200) else None,
+                "diff30": round(float(diff30), 2) if diff30 is not None else None,
+                "diff200": round(float(diff200), 2) if diff200 is not None else None,
+                "source": "yfinance",
             }
 
         except Exception as e:
-            last_error = e
-            logger.exception(f"抓取 {symbol} 失敗: {e}")
+            logger.exception(f"yfinance 抓取失敗 {stock_no} {symbol}: {e}")
 
-    raise ValueError(f"抓不到股票 {stock_no} 的資料，最後錯誤：{last_error}")
+    return None
 
 
-def recommendation_text(diff30: Optional[float]) -> Tuple[str, str]:
-    """
-    依 30 日均線差距，做簡單提示
-    """
+def fetch_stock_data(stock_no: str) -> dict:
+    data = fetch_from_twstock(stock_no)
+    if data:
+        return data
+
+    data = fetch_from_yfinance(stock_no)
+    if data:
+        return data
+
+    raise ValueError(f"抓不到股票 {stock_no} 的資料")
+
+
+# =========================
+# 推薦邏輯
+# =========================
+def recommendation_text(diff30: Optional[float], diff200: Optional[float]) -> Tuple[str, str]:
     if diff30 is None:
         return "⚪ 暫無法判斷", "資料不足"
 
     if diff30 < -8:
         return "🟢 可留意", "價格低於30日均線較多，可觀察是否止跌"
+
     if -8 <= diff30 <= 3:
-        return "🟢 可小量布局", "價格接近均線附近，可小量定期投入"
+        if diff200 is not None and diff200 < 15:
+            return "🟢 可小量布局", "價格接近均線附近，可小量定期投入"
+        return "🟡 可觀察", "短線接近30日均線，但離長均線仍有距離"
+
     if 3 < diff30 <= 10:
         return "🟡 不宜追高", "價格高於30日均線，建議等拉回"
+
     return "🔴 偏熱", "價格離30日均線過遠，短線不建議追價"
 
 
 def format_stock_report(stock_no: str) -> str:
     try:
         data = fetch_stock_data(stock_no)
-        suggest, reason = recommendation_text(data["diff30"])
+        stock_name = get_stock_name(stock_no)
+        suggest, reason = recommendation_text(data["diff30"], data["diff200"])
 
         lines = []
-        lines.append(f"📌 {stock_no} 重點：")
+        lines.append(f"📌 {stock_no} {stock_name} 重點：")
         lines.append(f"最近交易日收盤價：{data['close']}")
         lines.append(f"交易日：{data['trade_date']}")
         lines.append(f"近30天平均價：{data['ma30'] if data['ma30'] is not None else '暫無資料'}")
-        lines.append(f"近300天平均價：{data['ma300'] if data['ma300'] is not None else '暫無資料'}")
+        lines.append(f"近200天平均價：{data['ma200'] if data['ma200'] is not None else '暫無資料'}")
         lines.append(f"與30日均差距：{str(data['diff30']) + '%' if data['diff30'] is not None else '暫無資料'}")
-        lines.append(f"與300日均差距：{str(data['diff300']) + '%' if data['diff300'] is not None else '暫無資料'}")
+        lines.append(f"與200日均差距：{str(data['diff200']) + '%' if data['diff200'] is not None else '暫無資料'}")
         lines.append(f"是否建議加碼：{suggest}")
         lines.append(f"原因：{reason}")
+        lines.append(f"資料來源：{data['source']}")
         return "\n".join(lines)
 
     except Exception as e:
@@ -262,10 +261,6 @@ def format_stock_report(stock_no: str) -> str:
 
 
 def build_market_summary() -> str:
-    """
-    簡單市場摘要。
-    這裡先保留固定文字，避免因額外資料源導致不穩。
-    """
     lines = []
     lines.append("📊 每日投資提醒")
     lines.append("")
@@ -306,11 +301,14 @@ def build_stock_list_text(user_id: str) -> str:
     if not stocks:
         return "你目前沒有自選股票，可輸入：新增股票 2330"
 
-    return "📋 你的自選股票：\n" + "\n".join([f"- {s}" for s in stocks])
+    lines = ["📋 你的自選股票："]
+    for s in stocks:
+        lines.append(f"- {s} {get_stock_name(s)}")
+    return "\n".join(lines)
 
 
 # =========================
-# 健康檢查
+# FastAPI routes
 # =========================
 @app.get("/")
 async def home():
@@ -322,9 +320,6 @@ async def health():
     return {"status": "healthy"}
 
 
-# =========================
-# Webhook
-# =========================
 @app.post("/webhook")
 async def webhook(request: Request):
     if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
@@ -349,10 +344,13 @@ async def webhook(request: Request):
 
 
 # =========================
-# LINE 訊息處理
+# LINE message handler
 # =========================
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event: MessageEvent):
+    user_id = "unknown_user"
+    text = ""
+
     try:
         user_id = event.source.user_id if event.source and event.source.user_id else "unknown_user"
         text = event.message.text.strip()
@@ -404,13 +402,17 @@ def handle_message(event: MessageEvent):
                 "狀態"
             )
 
+        logger.info(f"準備回覆: {reply_text[:1000]}")
+
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text=reply_text)
         )
 
+        logger.info("reply_message 成功")
+
     except Exception as e:
-        logger.exception(f"handle_message 發生錯誤: {e}")
+        logger.exception(f"handle_message 發生錯誤, text={text}, user_id={user_id}, error={e}")
         try:
             line_bot_api.reply_message(
                 event.reply_token,
