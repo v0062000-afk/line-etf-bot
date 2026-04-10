@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict, Any
 
+import requests
 from dotenv import load_dotenv
 import yfinance as yf
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -42,9 +43,12 @@ if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LINE ETF / 台股查詢機器人")
+app = FastAPI(title="LINE ETF / 台股混合穩定版")
 handler = WebhookHandler(CHANNEL_SECRET)
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+
+HTTP_TIMEOUT = 15
+HTTP_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 THEME_MAP: Dict[str, List[str]] = {
     "0056": ["高股息", "ETF配息", "台股ETF"],
@@ -55,8 +59,8 @@ THEME_MAP: Dict[str, List[str]] = {
     "2330": ["AI", "半導體", "CoWoS"],
     "2317": ["AI伺服器", "組裝", "電動車"],
     "2382": ["AI伺服器", "筆電", "電子代工"],
-    "3231": ["BBU", "AI伺服器電源", "電池備援"],
     "3017": ["AI伺服器", "散熱", "機殼"],
+    "3231": ["BBU", "AI伺服器電源", "電池備援"],
     "6669": ["半導體設備", "先進封裝", "CoWoS"],
 }
 
@@ -353,7 +357,157 @@ def get_fear_greed() -> Tuple[Optional[int], str]:
     return None, "unavailable"
 
 
-def get_price_data(symbol: str, lookback_days: int = 450) -> Dict[str, Any]:
+def _safe_float(text: Any) -> Optional[float]:
+    if text is None:
+        return None
+    s = str(text).strip().replace(",", "").replace(" ", "")
+    if s in {"", "--", "---", "----", "X", "N/A"}:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _month_iter(count: int) -> List[datetime]:
+    today = datetime.now(TAIWAN_TZ)
+    y = today.year
+    m = today.month
+    out: List[datetime] = []
+    for _ in range(count):
+        out.append(datetime(y, m, 1))
+        m -= 1
+        if m == 0:
+            m = 12
+            y -= 1
+    return out
+
+
+def _fetch_twse_month(stock_id: str, month_dt: datetime) -> List[Tuple[str, float]]:
+    date_str = month_dt.strftime("%Y%m01")
+    url = (
+        "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
+        f"?response=json&date={date_str}&stockNo={stock_id}"
+    )
+    r = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+
+    if data.get("stat") != "OK" or not data.get("data"):
+        return []
+
+    rows: List[Tuple[str, float]] = []
+    for row in data["data"]:
+        close_price = _safe_float(row[6])
+        if close_price is None:
+            continue
+
+        roc_date = str(row[0]).strip()
+        parts = roc_date.split("/")
+        if len(parts) == 3:
+            year = int(parts[0]) + 1911
+            month = int(parts[1])
+            day = int(parts[2])
+            gdate = f"{year:04d}-{month:02d}-{day:02d}"
+        else:
+            gdate = roc_date
+
+        rows.append((gdate, close_price))
+    return rows
+
+
+def _fetch_tpex_month(stock_id: str, month_dt: datetime) -> List[Tuple[str, float]]:
+    roc_year = month_dt.year - 1911
+    roc_month = month_dt.month
+    url = (
+        "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
+        f"?l=zh-tw&d={roc_year}/{roc_month:02d}&stkno={stock_id}"
+    )
+    r = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+
+    if not data.get("aaData"):
+        return []
+
+    rows: List[Tuple[str, float]] = []
+    for row in data["aaData"]:
+        close_price = _safe_float(row[2])
+        if close_price is None:
+            continue
+
+        roc_date = str(row[0]).strip()
+        parts = roc_date.split("/")
+        if len(parts) == 3:
+            year = int(parts[0]) + 1911
+            month = int(parts[1])
+            day = int(parts[2])
+            gdate = f"{year:04d}-{month:02d}-{day:02d}"
+        else:
+            gdate = roc_date
+
+        rows.append((gdate, close_price))
+    return rows
+
+
+def get_official_price_data(symbol: str, max_months: int = 18) -> Dict[str, Any]:
+    sym = normalize_symbol(symbol)
+    months = _month_iter(max_months)
+
+    rows: List[Tuple[str, float]] = []
+    market = None
+
+    for month_dt in months:
+        try:
+            month_rows = _fetch_twse_month(sym, month_dt)
+            if month_rows:
+                rows.extend(month_rows)
+                market = "TWSE"
+        except Exception:
+            pass
+
+    if not rows:
+        for month_dt in months:
+            try:
+                month_rows = _fetch_tpex_month(sym, month_dt)
+                if month_rows:
+                    rows.extend(month_rows)
+                    market = "TPEx"
+            except Exception:
+                pass
+
+    if not rows:
+        raise ValueError(f"官方抓不到 {sym} 資料")
+
+    dedup: Dict[str, float] = {}
+    for d, c in rows:
+        dedup[d] = c
+
+    sorted_rows = sorted(dedup.items(), key=lambda x: x[0])
+    closes = [c for _, c in sorted_rows]
+    if not closes:
+        raise ValueError(f"官方沒有 {sym} 有效收盤價")
+
+    latest_date, latest_close = sorted_rows[-1]
+    ma30_src = closes[-30:] if len(closes) >= 30 else closes
+    ma300_src = closes[-300:] if len(closes) >= 300 else closes
+
+    ma30 = sum(ma30_src) / len(ma30_src)
+    ma300 = sum(ma300_src) / len(ma300_src)
+
+    return {
+        "symbol": sym,
+        "source_symbol": market,
+        "close": round(latest_close, 2),
+        "ma30": round(ma30, 2),
+        "ma300": round(ma300, 2),
+        "vs_ma30_pct": round((latest_close - ma30) / ma30 * 100, 2),
+        "vs_ma300_pct": round((latest_close - ma300) / ma300 * 100, 2),
+        "data_date": latest_date,
+    }
+
+
+def get_yahoo_price_data(symbol: str, lookback_days: int = 450) -> Dict[str, Any]:
     sym = normalize_symbol(symbol)
     tried = [f"{sym}.TW", f"{sym}.TWO"]
     last_error = None
@@ -396,7 +550,24 @@ def get_price_data(symbol: str, lookback_days: int = 450) -> Dict[str, Any]:
             last_error = str(e)
             continue
 
-    raise ValueError(f"抓不到 {sym} 資料：{last_error or 'unknown error'}")
+    raise ValueError(f"Yahoo 抓不到 {sym} 資料：{last_error or 'unknown error'}")
+
+
+def get_hybrid_price_data(symbol: str) -> Dict[str, Any]:
+    official_error = None
+    yahoo_error = None
+
+    try:
+        return get_official_price_data(symbol)
+    except Exception as e:
+        official_error = str(e)
+
+    try:
+        return get_yahoo_price_data(symbol)
+    except Exception as e:
+        yahoo_error = str(e)
+
+    raise ValueError(f"官方失敗：{official_error}；Yahoo失敗：{yahoo_error}")
 
 
 def recommendation_for_stock(fear_value: Optional[int], data: Dict[str, Any], is_etf: bool = False) -> Tuple[str, str]:
@@ -497,7 +668,7 @@ def build_daily_report_for_user(user_id: str) -> str:
     extra_lines: List[str] = []
     for symbol in symbols:
         try:
-            data = get_price_data(symbol)
+            data = get_hybrid_price_data(symbol)
         except Exception as e:
             extra_lines.append(f"📌 {symbol} 抓取失敗：{e}")
             continue
