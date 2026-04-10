@@ -36,6 +36,7 @@ DATA_FILE = Path("user_stocks.json")
 def load_data() -> Dict[str, List[str]]:
     if not DATA_FILE.exists():
         return {}
+
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -100,12 +101,9 @@ def get_stock_name(stock_no: str) -> str:
 # 股票資料
 # =========================
 def fetch_from_twstock(stock_no: str) -> Optional[dict]:
-    """
-    優先用 twstock 抓台股 / ETF
-    """
     try:
         stock = twstock.Stock(stock_no)
-        data = stock.fetch_from(2024, 1)  # 抓久一點，方便算200日均線
+        data = stock.fetch_from(2024, 1)
 
         if not data:
             return None
@@ -147,9 +145,6 @@ def fetch_from_twstock(stock_no: str) -> Optional[dict]:
 
 
 def fetch_from_yfinance(stock_no: str) -> Optional[dict]:
-    """
-    twstock 抓不到時，再用 yfinance 補
-    """
     candidates = [f"{stock_no}.TW", f"{stock_no}.TWO"]
 
     for symbol in candidates:
@@ -178,14 +173,13 @@ def fetch_from_yfinance(stock_no: str) -> Optional[dict]:
                 continue
 
             close_price = float(close_col.iloc[-1])
+            trade_date = str(close_col.index[-1])[:10]
 
             ma30 = close_col.rolling(30).mean().iloc[-1] if len(close_col) >= 30 else None
             ma200 = close_col.rolling(200).mean().iloc[-1] if len(close_col) >= 200 else None
 
             diff30 = ((close_price - ma30) / ma30 * 100) if pd.notna(ma30) and ma30 != 0 else None
             diff200 = ((close_price - ma200) / ma200 * 100) if pd.notna(ma200) and ma200 != 0 else None
-
-            trade_date = str(close_col.index[-1])[:10]
 
             return {
                 "trade_date": trade_date,
