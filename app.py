@@ -9,7 +9,6 @@ from typing import List, Optional, Tuple, Dict, Any
 
 import requests
 from dotenv import load_dotenv
-import yfinance as yf
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from zoneinfo import ZoneInfo
@@ -36,6 +35,7 @@ BASE_WATCHLIST = [x.strip() for x in os.getenv("BASE_WATCHLIST", "0056").split("
 
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 
 if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
     raise RuntimeError("請先設定 LINE_CHANNEL_SECRET 與 LINE_CHANNEL_ACCESS_TOKEN")
@@ -43,12 +43,12 @@ if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LINE ETF / 台股混合穩定版")
+app = FastAPI(title="LINE ETF / 台股 FinMind 版")
 handler = WebhookHandler(CHANNEL_SECRET)
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 
-HTTP_TIMEOUT = 15
-HTTP_HEADERS = {"User-Agent": "Mozilla/5.0"}
+HTTP_TIMEOUT = 20
+FINMIND_BASE = "https://api.finmindtrade.com/api/v4/data"
 
 THEME_MAP: Dict[str, List[str]] = {
     "0056": ["高股息", "ETF配息", "台股ETF"],
@@ -308,6 +308,30 @@ def redeem_code(user_id: str, code: str) -> Tuple[bool, str]:
     return True, f"兌換成功，已延長 {row['days']} 天，到期日：{new_expire.strftime('%Y-%m-%d %H:%M')}"
 
 
+def finmind_headers() -> Dict[str, str]:
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if FINMIND_TOKEN:
+        headers["Authorization"] = f"Bearer {FINMIND_TOKEN}"
+    return headers
+
+
+def finmind_get_data(dataset: str, **params: Any) -> List[Dict[str, Any]]:
+    query = {"dataset": dataset}
+    query.update(params)
+
+    r = requests.get(FINMIND_BASE, headers=finmind_headers(), params=query, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    payload = r.json()
+
+    if payload.get("status") not in (200, None):
+        raise ValueError(payload.get("msg", "FinMind API error"))
+
+    data = payload.get("data", [])
+    if not isinstance(data, list):
+        raise ValueError("FinMind data format error")
+    return data
+
+
 def vix_to_fear_proxy(vix_value: float) -> int:
     if vix_value >= 40:
         return 5
@@ -343,152 +367,63 @@ def fear_label(value: Optional[int]) -> str:
 
 
 def get_fear_greed() -> Tuple[Optional[int], str]:
+    today = datetime.now(TAIWAN_TZ).date()
+    start_date = (today - timedelta(days=14)).strftime("%Y-%m-%d")
+
     try:
-        vix_df = yf.Ticker("^VIX").history(period="10d", auto_adjust=False)
-        if vix_df is not None and not vix_df.empty:
-            close = vix_df["Close"].dropna()
-            if not close.empty:
-                latest_vix = float(close.iloc[-1])
-                proxy_score = vix_to_fear_proxy(latest_vix)
-                return proxy_score, f"VIX fallback ({latest_vix:.2f})"
+        rows = finmind_get_data("CnnFearGreedIndex", start_date=start_date)
+        if rows:
+            row = rows[-1]
+            value = row.get("value")
+            if value is None:
+                value = row.get("fear_greed_index")
+            if value is not None:
+                return int(round(float(value))), "FinMind CnnFearGreedIndex"
     except Exception as e:
-        logger.exception("VIX 抓取失敗: %s", e)
+        logger.exception("Fear & Greed 抓取失敗: %s", e)
 
     return None, "unavailable"
 
 
-def _safe_float(text: Any) -> Optional[float]:
-    if text is None:
-        return None
-    s = str(text).strip().replace(",", "").replace(" ", "")
-    if s in {"", "--", "---", "----", "X", "N/A"}:
+def _to_float(v: Any) -> Optional[float]:
+    if v is None:
         return None
     try:
-        return float(s)
+        return float(str(v).replace(",", "").strip())
     except Exception:
         return None
 
 
-def _month_iter(count: int) -> List[datetime]:
-    today = datetime.now(TAIWAN_TZ)
-    y = today.year
-    m = today.month
-    out: List[datetime] = []
-    for _ in range(count):
-        out.append(datetime(y, m, 1))
-        m -= 1
-        if m == 0:
-            m = 12
-            y -= 1
-    return out
-
-
-def _fetch_twse_month(stock_id: str, month_dt: datetime) -> List[Tuple[str, float]]:
-    date_str = month_dt.strftime("%Y%m01")
-    url = (
-        "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
-        f"?response=json&date={date_str}&stockNo={stock_id}"
-    )
-    r = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-
-    if data.get("stat") != "OK" or not data.get("data"):
-        return []
-
-    rows: List[Tuple[str, float]] = []
-    for row in data["data"]:
-        close_price = _safe_float(row[6])
-        if close_price is None:
-            continue
-
-        roc_date = str(row[0]).strip()
-        parts = roc_date.split("/")
-        if len(parts) == 3:
-            year = int(parts[0]) + 1911
-            month = int(parts[1])
-            day = int(parts[2])
-            gdate = f"{year:04d}-{month:02d}-{day:02d}"
-        else:
-            gdate = roc_date
-
-        rows.append((gdate, close_price))
-    return rows
-
-
-def _fetch_tpex_month(stock_id: str, month_dt: datetime) -> List[Tuple[str, float]]:
-    roc_year = month_dt.year - 1911
-    roc_month = month_dt.month
-    url = (
-        "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
-        f"?l=zh-tw&d={roc_year}/{roc_month:02d}&stkno={stock_id}"
-    )
-    r = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-
-    if not data.get("aaData"):
-        return []
-
-    rows: List[Tuple[str, float]] = []
-    for row in data["aaData"]:
-        close_price = _safe_float(row[2])
-        if close_price is None:
-            continue
-
-        roc_date = str(row[0]).strip()
-        parts = roc_date.split("/")
-        if len(parts) == 3:
-            year = int(parts[0]) + 1911
-            month = int(parts[1])
-            day = int(parts[2])
-            gdate = f"{year:04d}-{month:02d}-{day:02d}"
-        else:
-            gdate = roc_date
-
-        rows.append((gdate, close_price))
-    return rows
-
-
-def get_official_price_data(symbol: str, max_months: int = 18) -> Dict[str, Any]:
+def get_finmind_price_data(symbol: str, lookback_days: int = 450) -> Dict[str, Any]:
     sym = normalize_symbol(symbol)
-    months = _month_iter(max_months)
+    start_date = (datetime.now(TAIWAN_TZ).date() - timedelta(days=lookback_days * 2)).strftime("%Y-%m-%d")
+    end_date = datetime.now(TAIWAN_TZ).date().strftime("%Y-%m-%d")
 
-    rows: List[Tuple[str, float]] = []
-    market = None
-
-    for month_dt in months:
-        try:
-            month_rows = _fetch_twse_month(sym, month_dt)
-            if month_rows:
-                rows.extend(month_rows)
-                market = "TWSE"
-        except Exception:
-            pass
+    rows = finmind_get_data(
+        "TaiwanStockPrice",
+        data_id=sym,
+        start_date=start_date,
+        end_date=end_date,
+    )
 
     if not rows:
-        for month_dt in months:
-            try:
-                month_rows = _fetch_tpex_month(sym, month_dt)
-                if month_rows:
-                    rows.extend(month_rows)
-                    market = "TPEx"
-            except Exception:
-                pass
+        raise ValueError(f"FinMind 抓不到 {sym} 資料")
 
-    if not rows:
-        raise ValueError(f"官方抓不到 {sym} 資料")
+    cleaned: List[Tuple[str, float]] = []
+    for row in rows:
+        close_price = _to_float(row.get("close"))
+        date_str = row.get("date")
+        if close_price is None or not date_str:
+            continue
+        cleaned.append((str(date_str), close_price))
 
-    dedup: Dict[str, float] = {}
-    for d, c in rows:
-        dedup[d] = c
+    if not cleaned:
+        raise ValueError(f"FinMind 沒有 {sym} 有效收盤價")
 
-    sorted_rows = sorted(dedup.items(), key=lambda x: x[0])
-    closes = [c for _, c in sorted_rows]
-    if not closes:
-        raise ValueError(f"官方沒有 {sym} 有效收盤價")
+    cleaned.sort(key=lambda x: x[0])
+    closes = [p for _, p in cleaned]
+    latest_date, latest_price = cleaned[-1]
 
-    latest_date, latest_close = sorted_rows[-1]
     ma30_src = closes[-30:] if len(closes) >= 30 else closes
     ma300_src = closes[-300:] if len(closes) >= 300 else closes
 
@@ -497,77 +432,14 @@ def get_official_price_data(symbol: str, max_months: int = 18) -> Dict[str, Any]
 
     return {
         "symbol": sym,
-        "source_symbol": market,
-        "close": round(latest_close, 2),
+        "source_symbol": "FinMind",
+        "close": round(latest_price, 2),
         "ma30": round(ma30, 2),
         "ma300": round(ma300, 2),
-        "vs_ma30_pct": round((latest_close - ma30) / ma30 * 100, 2),
-        "vs_ma300_pct": round((latest_close - ma300) / ma300 * 100, 2),
+        "vs_ma30_pct": round((latest_price - ma30) / ma30 * 100, 2),
+        "vs_ma300_pct": round((latest_price - ma300) / ma300 * 100, 2),
         "data_date": latest_date,
     }
-
-
-def get_yahoo_price_data(symbol: str, lookback_days: int = 450) -> Dict[str, Any]:
-    sym = normalize_symbol(symbol)
-    tried = [f"{sym}.TW", f"{sym}.TWO"]
-    last_error = None
-
-    for ticker in tried:
-        try:
-            df = yf.Ticker(ticker).history(period=f"{lookback_days}d", auto_adjust=False)
-            if df is None or df.empty:
-                last_error = "empty dataframe"
-                continue
-
-            close = df["Close"].dropna()
-            if close.empty:
-                last_error = "empty close"
-                continue
-
-            latest_dt = close.index[-1]
-            latest_price = float(close.iloc[-1])
-
-            ma30 = float(close.tail(30).mean()) if len(close) >= 30 else float(close.mean())
-            ma300 = float(close.tail(300).mean()) if len(close) >= 300 else float(close.mean())
-
-            try:
-                latest_date = latest_dt.tz_localize(None).strftime("%Y-%m-%d")
-            except Exception:
-                latest_date = latest_dt.strftime("%Y-%m-%d")
-
-            return {
-                "symbol": sym,
-                "source_symbol": ticker,
-                "close": round(latest_price, 2),
-                "ma30": round(ma30, 2),
-                "ma300": round(ma300, 2),
-                "vs_ma30_pct": round((latest_price - ma30) / ma30 * 100, 2),
-                "vs_ma300_pct": round((latest_price - ma300) / ma300 * 100, 2),
-                "data_date": latest_date,
-            }
-
-        except Exception as e:
-            last_error = str(e)
-            continue
-
-    raise ValueError(f"Yahoo 抓不到 {sym} 資料：{last_error or 'unknown error'}")
-
-
-def get_hybrid_price_data(symbol: str) -> Dict[str, Any]:
-    official_error = None
-    yahoo_error = None
-
-    try:
-        return get_official_price_data(symbol)
-    except Exception as e:
-        official_error = str(e)
-
-    try:
-        return get_yahoo_price_data(symbol)
-    except Exception as e:
-        yahoo_error = str(e)
-
-    raise ValueError(f"官方失敗：{official_error}；Yahoo失敗：{yahoo_error}")
 
 
 def recommendation_for_stock(fear_value: Optional[int], data: Dict[str, Any], is_etf: bool = False) -> Tuple[str, str]:
@@ -644,22 +516,13 @@ def build_daily_report_for_user(user_id: str) -> str:
         "",
     ]
 
-    if fg_source.startswith("VIX fallback"):
-        lines.extend(
-            [
-                f"😱 市場情緒代理值：{fear_value if fear_value is not None else 'N/A'}（{fear_label(fear_value)}）",
-                f"資料來源：{fg_source}",
-                "",
-            ]
-        )
-    else:
-        lines.extend(
-            [
-                f"😱 恐慌指數：{fear_value if fear_value is not None else 'N/A'}（{fear_label(fear_value)}）",
-                f"資料來源：{fg_source}",
-                "",
-            ]
-        )
+    lines.extend(
+        [
+            f"😱 恐慌指數：{fear_value if fear_value is not None else 'N/A'}（{fear_label(fear_value)}）",
+            f"資料來源：{fg_source}",
+            "",
+        ]
+    )
 
     symbols = get_subscriptions(user_id)
     if "0056" not in symbols:
@@ -668,7 +531,7 @@ def build_daily_report_for_user(user_id: str) -> str:
     extra_lines: List[str] = []
     for symbol in symbols:
         try:
-            data = get_hybrid_price_data(symbol)
+            data = get_finmind_price_data(symbol)
         except Exception as e:
             extra_lines.append(f"📌 {symbol} 抓取失敗：{e}")
             continue
