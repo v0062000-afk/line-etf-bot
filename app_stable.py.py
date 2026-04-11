@@ -4,9 +4,7 @@ import sqlite3
 import random
 import string
 import logging
-import csv
-import io
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict, Any
 
 import requests
@@ -45,7 +43,7 @@ if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LINE ETF / 台股 FinMind + CNN/VIX 版")
+app = FastAPI(title="LINE ETF / 台股 FinMind 版")
 handler = WebhookHandler(CHANNEL_SECRET)
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 
@@ -65,9 +63,6 @@ THEME_MAP: Dict[str, List[str]] = {
     "3231": ["BBU", "AI伺服器電源", "電池備援"],
     "6669": ["半導體設備", "先進封裝", "CoWoS"],
 }
-
-_STOCK_NAME_CACHE: Dict[str, str] = {}
-_STOCK_NAME_CACHE_DATE: Optional[date] = None
 
 
 def db_conn() -> sqlite3.Connection:
@@ -146,17 +141,8 @@ def parse_dt(text: Optional[str]) -> Optional[datetime]:
     return datetime.fromisoformat(text)
 
 
-def db_now() -> datetime:
-    return datetime.now(TAIWAN_TZ)
-
-
 def normalize_symbol(symbol: str) -> str:
     return symbol.strip().upper().replace(".TW", "").replace(".TWO", "")
-
-
-def db_conn_commit_close(conn: sqlite3.Connection) -> None:
-    conn.commit()
-    conn.close()
 
 
 def ensure_user(user_id: str) -> None:
@@ -165,7 +151,7 @@ def ensure_user(user_id: str) -> None:
     row = cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)).fetchone()
 
     if row is None:
-        expires_at = (db_now() + timedelta(days=DEFAULT_TRIAL_DAYS)).isoformat()
+        expires_at = (datetime.now(TAIWAN_TZ) + timedelta(days=DEFAULT_TRIAL_DAYS)).isoformat()
         cur.execute(
             """
             INSERT INTO users (user_id, created_at, last_seen_at, access_expires_at, plan_name)
@@ -188,7 +174,8 @@ def ensure_user(user_id: str) -> None:
             (now_str(), user_id),
         )
 
-    db_conn_commit_close(conn)
+    conn.commit()
+    conn.close()
 
 
 def user_status(user_id: str) -> Tuple[bool, Optional[datetime], str]:
@@ -203,7 +190,7 @@ def user_status(user_id: str) -> Tuple[bool, Optional[datetime], str]:
         return False, None, "unknown"
 
     expires_at = parse_dt(row["access_expires_at"])
-    active = bool(expires_at and expires_at >= db_now())
+    active = bool(expires_at and expires_at >= datetime.now(TAIWAN_TZ))
     return active, expires_at, row["plan_name"]
 
 
@@ -217,7 +204,8 @@ def add_subscription(user_id: str, symbol: str) -> str:
         """,
         (user_id, symbol, now_str()),
     )
-    db_conn_commit_close(conn)
+    conn.commit()
+    conn.close()
     return symbol
 
 
@@ -225,7 +213,8 @@ def remove_subscription(user_id: str, symbol: str) -> str:
     symbol = normalize_symbol(symbol)
     conn = db_conn()
     conn.execute("DELETE FROM subscriptions WHERE user_id = ? AND symbol = ?", (user_id, symbol))
-    db_conn_commit_close(conn)
+    conn.commit()
+    conn.close()
     return symbol
 
 
@@ -248,8 +237,9 @@ def generate_code(
 ) -> str:
     code = "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
     expires_at = None
+
     if expires_days:
-        expires_at = (db_now() + timedelta(days=expires_days)).isoformat()
+        expires_at = (datetime.now(TAIWAN_TZ) + timedelta(days=expires_days)).isoformat()
 
     conn = db_conn()
     conn.execute(
@@ -260,7 +250,8 @@ def generate_code(
         """,
         (code, days, max_uses, expires_at, now_str(), created_by, note),
     )
-    db_conn_commit_close(conn)
+    conn.commit()
+    conn.close()
     return code
 
 
@@ -275,7 +266,7 @@ def redeem_code(user_id: str, code: str) -> Tuple[bool, str]:
         return False, "查無此序號。"
 
     expires_at = parse_dt(row["expires_at"])
-    if expires_at and expires_at < db_now():
+    if expires_at and expires_at < datetime.now(TAIWAN_TZ):
         conn.close()
         return False, "此序號已過期。"
 
@@ -288,7 +279,7 @@ def redeem_code(user_id: str, code: str) -> Tuple[bool, str]:
         (user_id,),
     ).fetchone()
 
-    base = db_now()
+    base = datetime.now(TAIWAN_TZ)
     if user_row and user_row["access_expires_at"]:
         current_expire = parse_dt(user_row["access_expires_at"])
         if current_expire and current_expire > base:
@@ -311,7 +302,8 @@ def redeem_code(user_id: str, code: str) -> Tuple[bool, str]:
         """,
         (code, user_id, now_str(), row["days"]),
     )
-    db_conn_commit_close(conn)
+    conn.commit()
+    conn.close()
 
     return True, f"兌換成功，已延長 {row['days']} 天，到期日：{new_expire.strftime('%Y-%m-%d %H:%M')}"
 
@@ -340,6 +332,59 @@ def finmind_get_data(dataset: str, **params: Any) -> List[Dict[str, Any]]:
     return data
 
 
+def vix_to_fear_proxy(vix_value: float) -> int:
+    if vix_value >= 40:
+        return 5
+    if vix_value >= 35:
+        return 10
+    if vix_value >= 30:
+        return 20
+    if vix_value >= 25:
+        return 30
+    if vix_value >= 20:
+        return 45
+    if vix_value >= 17:
+        return 55
+    if vix_value >= 14:
+        return 70
+    if vix_value >= 11:
+        return 82
+    return 90
+
+
+def fear_label(value: Optional[int]) -> str:
+    if value is None:
+        return "無法取得"
+    if value <= 24:
+        return "極度恐慌"
+    if value <= 44:
+        return "恐慌"
+    if value <= 54:
+        return "中性"
+    if value <= 74:
+        return "貪婪"
+    return "極度貪婪"
+
+
+def get_fear_greed() -> Tuple[Optional[int], str]:
+    today = datetime.now(TAIWAN_TZ).date()
+    start_date = (today - timedelta(days=14)).strftime("%Y-%m-%d")
+
+    try:
+        rows = finmind_get_data("CnnFearGreedIndex", start_date=start_date)
+        if rows:
+            row = rows[-1]
+            value = row.get("value")
+            if value is None:
+                value = row.get("fear_greed_index")
+            if value is not None:
+                return int(round(float(value))), "FinMind CnnFearGreedIndex"
+    except Exception as e:
+        logger.exception("Fear & Greed 抓取失敗: %s", e)
+
+    return None, "unavailable"
+
+
 def _to_float(v: Any) -> Optional[float]:
     if v is None:
         return None
@@ -349,41 +394,10 @@ def _to_float(v: Any) -> Optional[float]:
         return None
 
 
-def get_stock_name_map() -> Dict[str, str]:
-    global _STOCK_NAME_CACHE, _STOCK_NAME_CACHE_DATE
-
-    today = db_now().date()
-    if _STOCK_NAME_CACHE and _STOCK_NAME_CACHE_DATE == today:
-        return _STOCK_NAME_CACHE
-
-    try:
-        rows = finmind_get_data("TaiwanStockInfo")
-        mapping: Dict[str, str] = {}
-        for row in rows:
-            stock_id = str(row.get("stock_id", "")).strip()
-            stock_name = str(row.get("stock_name", "")).strip()
-            if stock_id and stock_name:
-                mapping[stock_id] = stock_name
-
-        _STOCK_NAME_CACHE = mapping
-        _STOCK_NAME_CACHE_DATE = today
-        return _STOCK_NAME_CACHE
-    except Exception as e:
-        logger.exception("TaiwanStockInfo 抓取失敗: %s", e)
-        return _STOCK_NAME_CACHE
-
-
-def get_stock_display_name(symbol: str) -> str:
+def get_finmind_price_data(symbol: str, lookback_days: int = 450) -> Dict[str, Any]:
     sym = normalize_symbol(symbol)
-    name_map = get_stock_name_map()
-    cname = name_map.get(sym, "")
-    return f"{sym} {cname}".strip()
-
-
-def get_finmind_price_data(symbol: str, lookback_days: int = 480) -> Dict[str, Any]:
-    sym = normalize_symbol(symbol)
-    start_date = (db_now().date() - timedelta(days=lookback_days * 2)).strftime("%Y-%m-%d")
-    end_date = db_now().date().strftime("%Y-%m-%d")
+    start_date = (datetime.now(TAIWAN_TZ).date() - timedelta(days=lookback_days * 2)).strftime("%Y-%m-%d")
+    end_date = datetime.now(TAIWAN_TZ).date().strftime("%Y-%m-%d")
 
     rows = finmind_get_data(
         "TaiwanStockPrice",
@@ -410,175 +424,39 @@ def get_finmind_price_data(symbol: str, lookback_days: int = 480) -> Dict[str, A
     closes = [p for _, p in cleaned]
     latest_date, latest_price = cleaned[-1]
 
-    ma20_src = closes[-20:] if len(closes) >= 20 else closes
-    ma60_src = closes[-60:] if len(closes) >= 60 else closes
-    ma120_src = closes[-120:] if len(closes) >= 120 else closes
-    ma240_src = closes[-240:] if len(closes) >= 240 else closes
+    ma30_src = closes[-30:] if len(closes) >= 30 else closes
+    ma300_src = closes[-300:] if len(closes) >= 300 else closes
 
-    ma20 = sum(ma20_src) / len(ma20_src)
-    ma60 = sum(ma60_src) / len(ma60_src)
-    ma120 = sum(ma120_src) / len(ma120_src)
-    ma240 = sum(ma240_src) / len(ma240_src)
+    ma30 = sum(ma30_src) / len(ma30_src)
+    ma300 = sum(ma300_src) / len(ma300_src)
 
     return {
         "symbol": sym,
-        "display_name": get_stock_display_name(sym),
         "source_symbol": "FinMind",
         "close": round(latest_price, 2),
-        "ma20": round(ma20, 2),
-        "ma60": round(ma60, 2),
-        "ma120": round(ma120, 2),
-        "ma240": round(ma240, 2),
-        "vs_ma20_pct": round((latest_price - ma20) / ma20 * 100, 2),
-        "vs_ma60_pct": round((latest_price - ma60) / ma60 * 100, 2),
-        "vs_ma120_pct": round((latest_price - ma120) / ma120 * 100, 2),
-        "vs_ma240_pct": round((latest_price - ma240) / ma240 * 100, 2),
+        "ma30": round(ma30, 2),
+        "ma300": round(ma300, 2),
+        "vs_ma30_pct": round((latest_price - ma30) / ma30 * 100, 2),
+        "vs_ma300_pct": round((latest_price - ma300) / ma300 * 100, 2),
         "data_date": latest_date,
     }
 
 
-def fear_label(value: Optional[int]) -> str:
-    if value is None:
-        return "無法取得"
-    if value <= 24:
-        return "極度恐慌"
-    if value <= 44:
-        return "恐慌"
-    if value <= 54:
-        return "中性"
-    if value <= 74:
-        return "貪婪"
-    return "極度貪婪"
-
-
-def vix_to_fear_proxy(vix_value: float) -> int:
-    if vix_value >= 40:
-        return 5
-    if vix_value >= 35:
-        return 10
-    if vix_value >= 30:
-        return 20
-    if vix_value >= 25:
-        return 30
-    if vix_value >= 20:
-        return 45
-    if vix_value >= 17:
-        return 55
-    if vix_value >= 14:
-        return 70
-    if vix_value >= 11:
-        return 82
-    return 90
-
-
-def get_fred_vix_value() -> Optional[float]:
-    url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=VIXCLS"
-    r = requests.get(url, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-
-    reader = csv.DictReader(io.StringIO(r.text))
-    last_value: Optional[float] = None
-    for row in reader:
-        value = row.get("VIXCLS")
-        if value and value != ".":
-            try:
-                last_value = float(value)
-            except Exception:
-                continue
-    return last_value
-
-
-def _search_score_in_html(html: str, patterns: List[str]) -> Optional[int]:
-    for pattern in patterns:
-        m = re.search(pattern, html, flags=re.I | re.S)
-        if not m:
-            continue
-
-        for group in m.groups():
-            if group is None:
-                continue
-            try:
-                val = float(group)
-                if 0 <= val <= 100:
-                    return int(round(val))
-            except Exception:
-                continue
-    return None
-
-
-def get_cnn_fear_greed() -> Tuple[Optional[int], str]:
-    # 1) CNN 官網
-    try:
-        r = requests.get(
-            "https://edition.cnn.com/markets/fear-and-greed",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=HTTP_TIMEOUT,
-        )
-        r.raise_for_status()
-        html = r.text
-
-        patterns = [
-            r'"fear_and_greed"\s*:\s*\{\s*"score"\s*:\s*(\d{1,3})',
-            r'"score"\s*:\s*(\d{1,3})\s*,\s*"rating"',
-            r'Fear\s*&\s*Greed[^0-9]{0,120}(\d{1,3})',
-            r'Extreme\s+Fear|Fear|Neutral|Greed|Extreme\s+Greed',
-        ]
-
-        score = _search_score_in_html(html, patterns)
-        if score is not None:
-            return score, "CNN"
-    except Exception as e:
-        logger.exception("CNN Fear & Greed 抓取失敗: %s", e)
-
-    # 2) MacroMicro 鏡像頁，仍然是 CNN 指數內容
-    try:
-        r = requests.get(
-            "https://en.macromicro.me/charts/50108/cnn-fear-and-greed",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=HTTP_TIMEOUT,
-        )
-        r.raise_for_status()
-        html = r.text
-
-        patterns = [
-            r'CNN Fear and Greed Index.*?(\d{4}-\d{2}-\d{2}).*?(\d{1,3}(?:\.\d+)?)',
-            r'CNN Fear and Greed Index[^0-9]{0,120}(\d{1,3}(?:\.\d+)?)',
-            r'Fear and Greed Index.*?(\d{1,3}(?:\.\d+)?)',
-        ]
-
-        score = _search_score_in_html(html, patterns)
-        if score is not None:
-            return score, "CNN mirror"
-    except Exception as e:
-        logger.exception("CNN mirror 抓取失敗: %s", e)
-
-    # 3) FRED VIX fallback
-    try:
-        vix_value = get_fred_vix_value()
-        if vix_value is not None:
-            return vix_to_fear_proxy(vix_value), f"VIX fallback ({vix_value:.2f})"
-    except Exception as e:
-        logger.exception("FRED VIX 抓取失敗: %s", e)
-
-    return None, "unavailable"
-
-
 def recommendation_for_stock(fear_value: Optional[int], data: Dict[str, Any], is_etf: bool = False) -> Tuple[str, str]:
-    diff20 = data["vs_ma20_pct"]
-    diff60 = data["vs_ma60_pct"]
-    diff240 = data["vs_ma240_pct"]
+    diff30 = data["vs_ma30_pct"]
+    diff300 = data["vs_ma300_pct"]
 
-    if fear_value is not None and fear_value < 25 and diff20 <= -3:
-        return "🔥 強烈加碼", "市場偏恐慌，且價格低於月線 3% 以上。"
+    if fear_value is not None and fear_value < 25 and diff30 <= -3:
+        return "🔥 強烈加碼", "市場偏恐慌，且價格低於近30日均線 3% 以上。"
 
-    if (fear_value is not None and fear_value < 35 and diff20 <= 0) or diff240 <= -5:
+    if (fear_value is not None and fear_value < 35 and diff30 <= 0) or diff300 <= -5:
         return "🟡 可分批加碼", "情緒偏弱或價格回到均線附近，可分批布局。"
 
-    if diff20 > 6 and diff240 > 15 and not is_etf:
+    if diff30 > 6 and diff300 > 15 and not is_etf:
         return "⚠️ 先觀望", "股價已明顯高於短中期均線，追價風險較高。"
 
-    if diff20 > 3 and diff240 > 8 and is_etf:
-        return "⚠️ 先觀望", "價格高於月線與年線較多，先保留資金。"
+    if diff30 > 3 and diff300 > 8 and is_etf:
+        return "⚠️ 先觀望", "價格高於短中期均線較多，先保留資金。"
 
     return "🟢 可小量布局", "價格接近均線附近，可小量定期投入。"
 
@@ -592,11 +470,11 @@ def get_recent_theme(symbol: str) -> str:
 
 
 def estimate_major_holder_cost_zone(data: Dict[str, Any]) -> Tuple[str, str]:
-    ma20 = data["ma20"]
-    ma240 = data["ma240"]
+    ma30 = data["ma30"]
+    ma300 = data["ma300"]
     close = data["close"]
 
-    center = ma20 * 0.65 + ma240 * 0.35
+    center = ma30 * 0.7 + ma300 * 0.3
     low = center * 0.97
     high = center * 1.03
 
@@ -610,40 +488,41 @@ def estimate_major_holder_cost_zone(data: Dict[str, Any]) -> Tuple[str, str]:
     return f"{low:.2f} ~ {high:.2f}", desc
 
 
-def format_stock_block(data: Dict[str, Any], fear_value: Optional[int], is_etf: bool = False) -> List[str]:
-    rec, reason = recommendation_for_stock(fear_value, data, is_etf=is_etf)
+def general_stock_summary(data: Dict[str, Any], fear_value: Optional[int]) -> str:
+    rec, reason = recommendation_for_stock(fear_value, data, is_etf=False)
     themes = get_recent_theme(data["symbol"])
     cost_zone, cost_desc = estimate_major_holder_cost_zone(data)
 
-    return [
-        f"📌 {data['display_name']} 重點：",
-        f"收盤價：{data['close']}",
-        f"月線(20)：{data['ma20']}",
-        f"季線(60)：{data['ma60']}",
-        f"半年線(120)：{data['ma120']}",
-        f"年線(240)：{data['ma240']}",
-        f"與月線差距：{data['vs_ma20_pct']}%",
-        f"與季線差距：{data['vs_ma60_pct']}%",
-        f"與半年線差距：{data['vs_ma120_pct']}%",
-        f"與年線差距：{data['vs_ma240_pct']}%",
-        f"是否建議加碼：{rec}",
-        f"原因：{reason}",
-        f"近期題材：{themes}",
-        f"大戶成本區推估：{cost_zone}",
-        f"成本區判斷：{cost_desc}",
-    ]
+    return (
+        f"📌 {data['symbol']} 重點：\n"
+        f"收盤價：{data['close']}\n"
+        f"近30天平均價：{data['ma30']}\n"
+        f"近300天平均價：{data['ma300']}\n"
+        f"與30日均差距：{data['vs_ma30_pct']}%\n"
+        f"與300日均差距：{data['vs_ma300_pct']}%\n"
+        f"是否建議加碼：{rec}\n"
+        f"原因：{reason}\n"
+        f"近期題材：{themes}\n"
+        f"大戶成本區推估：{cost_zone}\n"
+        f"成本區判斷：{cost_desc}"
+    )
 
 
 def build_daily_report_for_user(user_id: str) -> str:
-    fear_value, fg_source = get_cnn_fear_greed()
+    fear_value, fg_source = get_fear_greed()
 
     lines = [
-        f"📊 每日投資提醒（{db_now().strftime('%Y/%m/%d %H:%M')}）",
-        "",
-        f"😱 CNN恐慌貪婪指數：{fear_value if fear_value is not None else 'N/A'}（{fear_label(fear_value)}）",
-        f"資料來源：{fg_source}",
+        f"📊 每日投資提醒（{datetime.now(TAIWAN_TZ).strftime('%Y/%m/%d %H:%M')}）",
         "",
     ]
+
+    lines.extend(
+        [
+            f"😱 恐慌指數：{fear_value if fear_value is not None else 'N/A'}（{fear_label(fear_value)}）",
+            f"資料來源：{fg_source}",
+            "",
+        ]
+    )
 
     symbols = get_subscriptions(user_id)
     if "0056" not in symbols:
@@ -654,19 +533,37 @@ def build_daily_report_for_user(user_id: str) -> str:
         try:
             data = get_finmind_price_data(symbol)
         except Exception as e:
-            extra_lines.append(f"📌 {normalize_symbol(symbol)} 抓取失敗：{e}")
+            extra_lines.append(f"📌 {symbol} 抓取失敗：{e}")
             continue
 
-        if normalize_symbol(symbol) == "0056":
-            lines.extend(format_stock_block(data, fear_value, is_etf=True))
-            lines.append("")
+        if symbol == "0056":
+            rec, reason = recommendation_for_stock(fear_value, data, is_etf=True)
+            themes = get_recent_theme(symbol)
+            cost_zone, cost_desc = estimate_major_holder_cost_zone(data)
+
+            lines.extend(
+                [
+                    "📈 0056 重點：",
+                    f"收盤價：{data['close']}",
+                    f"近30天平均價：{data['ma30']}",
+                    f"近300天平均價：{data['ma300']}",
+                    f"與30日均差距：{data['vs_ma30_pct']}%",
+                    f"與300日均差距：{data['vs_ma300_pct']}%",
+                    f"是否建議加碼：{rec}",
+                    f"原因：{reason}",
+                    f"近期題材：{themes}",
+                    f"大戶成本區推估：{cost_zone}",
+                    f"成本區判斷：{cost_desc}",
+                    "",
+                ]
+            )
         else:
-            extra_lines.extend(format_stock_block(data, fear_value, is_etf=False))
-            extra_lines.append("")
+            extra_lines.append(general_stock_summary(data, fear_value))
 
     if extra_lines:
         lines.append("👀 你的自選股票：")
         lines.extend(extra_lines)
+        lines.append("")
 
     lines.extend(
         [
@@ -737,8 +634,7 @@ def handle_text_command(user_id: str, text: str) -> str:
 
     if cmd == "我的股票":
         symbols = get_subscriptions(user_id)
-        display = [get_stock_display_name(s) for s in symbols]
-        return "你的股票：" + ("、".join(display) if display else "尚未設定")
+        return "你的股票：" + ("、".join(symbols) if symbols else "尚未設定")
 
     if cmd in {"今日報告", "今日", "report"}:
         if not active:
@@ -748,12 +644,12 @@ def handle_text_command(user_id: str, text: str) -> str:
     m = re.match(r"^新增股票\s+([0-9A-Za-z]{2,10})$", cmd)
     if m:
         symbol = add_subscription(user_id, m.group(1))
-        return f"已加入 {get_stock_display_name(symbol)} 到查詢清單。"
+        return f"已加入 {symbol} 到查詢清單。"
 
     m = re.match(r"^刪除股票\s+([0-9A-Za-z]{2,10})$", cmd)
     if m:
         symbol = remove_subscription(user_id, m.group(1))
-        return f"已刪除 {get_stock_display_name(symbol)}。"
+        return f"已刪除 {symbol}。"
 
     m = re.match(r"^兌換\s+([A-Za-z0-9]{6,20})$", cmd)
     if m:
